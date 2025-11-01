@@ -1,140 +1,114 @@
-# app.py
-import os
-import time
 import json
+import logging
+import time
 import hmac
 import hashlib
-import logging
-from flask import Flask, request, jsonify, abort
 import requests
+from flask import Flask, request, jsonify
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+# === Flask setup ===
 app = Flask(__name__)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
-# === Environment variables (set these in Render) ===
-API_KEY      = os.getenv("MEXC_API_KEY", "")
-API_SECRET   = os.getenv("MEXC_API_SECRET", "")
-ALERT_SECRET = os.getenv("ALERT_SECRET", "")
-DRY_RUN      = os.getenv("DRY_RUN", "true").lower() in ("1", "true", "yes")
-USE_TESTNET  = os.getenv("USE_TESTNET", "false").lower() in ("1", "true", "yes")
-LOG_WEBHOOK  = os.getenv("LOG_WEBHOOK", "true").lower() in ("1", "true", "yes")
+# === MEXC API ===
+API_KEY = "mx0vglcToeWBx8cgA1"
+API_SECRET = "4ff73650ded64544911de7fc0dd73f01"
+BASE_URL = "https://api.mexc.com"
 
-# === MEXC endpoints - confirm in their docs if they change ===
-# NOTE: verify contract/test/prod domains per MEXC docs
-BASE_PROD = "https://contract.mexc.com"
-BASE_TEST = "https://contract.mexc.com"   # change if MEXC testnet uses different host
-BASE = BASE_TEST if USE_TESTNET else BASE_PROD
+# === Webhook Secret ===
+WEBHOOK_SECRET = "my_tv_secret_123"
 
-# Common contract order path — verify for your account/API version
-ORDERS_PATH = "/api/v1/private/order/submit"
-
-def sign_params(access_key: str, secret: str, params: dict, timestamp_ms: int):
-    """
-    Sign request according to common MEXC contract rule:
-    signature = HMAC_SHA256(secret, accessKey + timestamp + json_body)
-    """
-    json_str = json.dumps(params, separators=(',', ':'), ensure_ascii=False) if params else ""
-    target = access_key + str(timestamp_ms) + json_str
-    signature = hmac.new(secret.encode(), target.encode(), hashlib.sha256).hexdigest()
-    return signature, json_str
-
-def place_futures_order(symbol, side, order_type="MARKET", quantity=None, price=None, leverage=3):
-    ts = int(time.time() * 1000)
-    body = {
-        "symbol": symbol,
-        "side": side,          # "BUY" / "SELL"
-        "type": order_type,    # "MARKET" / "LIMIT" (use exactly as MEXC expects)
-        "leverage": int(leverage)
-    }
-    if quantity is not None:
-        # Many MEXC contract endpoints expect "size" field for contract quantity
-        body["size"] = str(quantity)
-    if price is not None:
-        body["price"] = str(price)
-
-    # remove None values
-    body = {k:v for k,v in body.items() if v is not None}
-
-    sig, json_body = sign_params(API_KEY, API_SECRET, body, ts)
-    headers = {
-        "ApiKey": API_KEY,
-        "Request-Time": str(ts),
-        "Signature": sig,
-        "Content-Type": "application/json"
-    }
-    url = BASE + ORDERS_PATH
-    logging.info("Order URL: %s", url)
-    logging.info("Order payload: %s", json.dumps(body))
-    if DRY_RUN:
-        logging.info("DRY_RUN enabled — order not sent to MEXC")
-        return {"status": "dry_run", "payload": body}
+# === Utility Functions ===
+def get_server_time():
     try:
-        resp = requests.post(url, headers=headers, data=json_body, timeout=15)
-        logging.info("MEXC reply status: %s, body: %s", resp.status_code, resp.text)
-        try:
-            return resp.json()
-        except Exception:
-            return {"status_code": resp.status_code, "text": resp.text}
+        r = requests.get(f"{BASE_URL}/api/v3/time", timeout=15)
+        return r.json()["serverTime"]
     except Exception as e:
-        logging.exception("Error placing order")
-        return {"error": str(e)}
+        logging.error("❌ Failed to fetch server time: %s", e)
+        return int(time.time() * 1000)
 
+def sign_request(params):
+    query_string = "&".join([f"{key}={value}" for key, value in params.items()])
+    signature = hmac.new(API_SECRET.encode(), query_string.encode(), hashlib.sha256).hexdigest()
+    return signature
+
+def fetch_ticker(symbol):
+    """Fetch latest ticker price with retry and 15s timeout"""
+    url = f"{BASE_URL}/api/v3/ticker/price?symbol={symbol}"
+    try:
+        response = requests.get(url, timeout=15)
+        response.raise_for_status()
+        return float(response.json()["price"])
+    except Exception as e:
+        logging.warning("⚠️ First attempt failed (%s). Retrying once...", e)
+        try:
+            response = requests.get(url, timeout=15)
+            response.raise_for_status()
+            return float(response.json()["price"])
+        except Exception as e2:
+            logging.error("❌ Failed to fetch ticker after retry: %s", e2)
+            return None
+
+def place_market_order(symbol, side, qty, leverage):
+    try:
+        # Adjust position mode and leverage
+        params = {
+            "symbol": symbol,
+            "positionSide": "BOTH",
+            "leverage": leverage,
+            "timestamp": get_server_time()
+        }
+        params["signature"] = sign_request(params)
+        requests.post(f"{BASE_URL}/api/v3/leverage", headers={"X-MBX-APIKEY": API_KEY}, params=params, timeout=15)
+
+        order_params = {
+            "symbol": symbol,
+            "side": side.upper(),
+            "type": "MARKET",
+            "quantity": qty,
+            "timestamp": get_server_time()
+        }
+        order_params["signature"] = sign_request(order_params)
+
+        response = requests.post(f"{BASE_URL}/api/v3/order",
+                                 headers={"X-MBX-APIKEY": API_KEY},
+                                 params=order_params,
+                                 timeout=15)
+
+        if response.status_code == 200:
+            logging.info("✅ Market %s order executed successfully for %s qty", side.upper(), qty)
+        else:
+            logging.error("❌ Order failed: %s", response.text)
+
+    except Exception as e:
+        logging.error("❌ Error placing order: %s", e)
+
+# === Flask Route ===
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    payload = request.get_json(force=True, silent=True)
-    if payload is None:
-        logging.warning("No JSON payload received")
-        return abort(400, "invalid payload")
-    if LOG_WEBHOOK:
-        logging.info("Webhook received: %s", json.dumps(payload))
+    data = request.get_json()
+    logging.info("📩 Webhook received: %s", data)
 
-    # basic validation using ALERT_SECRET inside payload
-    if ALERT_SECRET and payload.get("secret") != ALERT_SECRET:
-        logging.warning("Invalid alert secret")
-        return abort(403, "invalid secret")
+    if not data or "secret" not in data or data["secret"] != WEBHOOK_SECRET:
+        return jsonify({"error": "Unauthorized"}), 403
 
-    symbol = payload.get("symbol")
-    side = payload.get("side", "BUY").upper()
-    order_type = payload.get("type", "MARKET").upper()
-    qty_usd = payload.get("qty_usd")        # optional: USD size
-    leverage = int(payload.get("leverage", 3))
-    price = payload.get("price")            # optional for limit orders
+    symbol = data.get("symbol", "BTCUSDT")
+    side = data.get("side", "BUY").upper()
+    qty_usd = float(data.get("qty_usd", 10))
+    leverage = int(data.get("leverage", 2))
 
-    if not symbol:
-        return abort(400, "symbol required")
+    price = fetch_ticker(symbol)
+    if price is None:
+        logging.error("❌ Could not fetch price, aborting order.")
+        return jsonify({"error": "Price fetch failed"}), 500
 
-    # If qty_usd provided, get current price and compute contract size (approx)
-    quantity = None
-    if qty_usd:
-        try:
-            ticker_url = f"{BASE}/api/v1/market/ticker?symbol={symbol}"
-            r = requests.get(ticker_url, timeout=8)
-            rj = r.json()
-            price_now = None
-            # adapt to response shape
-            data = rj.get("data") if isinstance(rj, dict) else None
-            if isinstance(data, dict):
-                # try several common keys
-                for k in ("lastPrice", "last", "price"):
-                    if data.get(k):
-                        price_now = float(data.get(k))
-                        break
-            if price_now is None:
-                logging.error("Could not parse ticker price from MEXC response")
-                return abort(502, "ticker parse fail")
-            quantity = float(qty_usd) / price_now
-        except Exception:
-            logging.exception("Failed to fetch ticker")
-            return abort(502, "failed to fetch ticker")
+    qty = round(qty_usd / price, 4)
+    logging.info("📊 Calculated quantity: %s %s @ %s USDT", qty, symbol, price)
 
-    result = place_futures_order(symbol=symbol, side=side, order_type=order_type,
-                                 quantity=quantity, price=price, leverage=leverage)
-    return jsonify({"status":"ok", "result": result})
+    place_market_order(symbol, side, qty, leverage)
 
-@app.route("/", methods=["GET"])
-def index():
-    return "MEXC Webhook up"
+    return jsonify({"success": True, "message": f"{side} order executed for {symbol}"}), 200
 
+# === Run Server ===
 if __name__ == "__main__":
-    port = int(os.getenv("PORT", "10000"))
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=10000)
