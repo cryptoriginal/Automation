@@ -1,23 +1,39 @@
+# app.py
 from flask import Flask, request, jsonify
 import os, time, json, hmac, hashlib, base64
 import requests
+import logging
 
 app = Flask(__name__)
+logging.basicConfig(level=logging.INFO)
 
-# ====== ENV CONFIG ======
+# ========== CONFIG (use env vars on Render) ==========
 BITGET_API_KEY = os.getenv("BITGET_API_KEY")
 BITGET_API_SECRET = os.getenv("BITGET_API_SECRET")
 BITGET_API_PASSPHRASE = os.getenv("BITGET_API_PASSPHRASE")
+# IMPORTANT: set this in Render to the USDT wallet amount you want the bot to use
+# Example: 10  -> means you want to use 10 USDT wallet * 3x leverage => 30 USDT notional
+TRADE_BALANCE_USDT = os.getenv("TRADE_BALANCE_USDT")  # string -> convert to float
 BITGET_BASE = "https://api.bitget.com"
+# =====================================================
 
-# ====== SIGNING HELPERS ======
+if not (BITGET_API_KEY and BITGET_API_SECRET and BITGET_API_PASSPHRASE):
+    app.logger.warning("One or more Bitget API credential env vars are missing. "
+                       "Set BITGET_API_KEY, BITGET_API_SECRET, BITGET_API_PASSPHRASE in Render.")
+
+if not TRADE_BALANCE_USDT:
+    app.logger.warning("TRADE_BALANCE_USDT env var not set. The app will fail to trade without it.")
+
 def sign(message: str) -> str:
+    if BITGET_API_SECRET is None:
+        raise RuntimeError("BITGET_API_SECRET is not set.")
     mac = hmac.new(BITGET_API_SECRET.encode("utf-8"), message.encode("utf-8"), hashlib.sha256).digest()
     return base64.b64encode(mac).decode()
 
 def get_headers(method: str, endpoint: str, body_str: str = "") -> dict:
     ts = str(int(time.time() * 1000))
-    signature = sign(f"{ts}{method}{endpoint}{body_str}")
+    message = f"{ts}{method}{endpoint}{body_str}"
+    signature = sign(message)
     return {
         "ACCESS-KEY": BITGET_API_KEY,
         "ACCESS-SIGN": signature,
@@ -27,105 +43,142 @@ def get_headers(method: str, endpoint: str, body_str: str = "") -> dict:
         "locale": "en-US"
     }
 
-# ====== BITGET API CALLS ======
-def fetch_futures_balance(symbol="BTCUSDT_UMCBL"):
-    """
-    Fetch futures balance for given symbol (using the single-account endpoint).
-    """
-    endpoint = f"/api/mix/v1/account/account?symbol={symbol}"
-    url = BITGET_BASE + endpoint
-    headers = get_headers("GET", endpoint)
-    r = requests.get(url, headers=headers, timeout=15)
-
-    try:
-        data = r.json()
-    except Exception:
-        raise RuntimeError(f"Failed to parse response: HTTP {r.status_code} {r.text}")
-
-    if not data or "data" not in data or not data["data"]:
-        raise RuntimeError(f"Invalid/empty balance response: {data}")
-
-    item = data["data"]
-    avail = item.get("available") or item.get("availableBalance") or item.get("usdtEquity")
-    if avail is None:
-        raise RuntimeError(f"Could not find balance field in response: {item}")
-
-    return float(avail)
-
+# --- Market utilities ---
 def fetch_mark_price(symbol):
     endpoint = f"/api/mix/v1/market/ticker?symbol={symbol}&productType=umcbl"
     url = BITGET_BASE + endpoint
-    headers = get_headers("GET", endpoint)
+    headers = get_headers("GET", endpoint, "")
     r = requests.get(url, headers=headers, timeout=10)
-    j = r.json()
-    d = j.get("data", {})
-    last = d.get("last") or d.get("lastPrice") or d.get("close")
+    try:
+        j = r.json()
+    except Exception:
+        raise RuntimeError(f"Failed to fetch ticker: HTTP {r.status_code} {r.text}")
+    d = j.get("data")
+    if not d:
+        raise RuntimeError(f"Invalid ticker response: {j}")
+    last = None
+    if isinstance(d, dict):
+        last = d.get("last") or d.get("lastPrice") or d.get("close") or d.get("price")
+    elif isinstance(d, list) and d:
+        last = d[0].get("last") or d[0].get("lastPrice")
+    if last is None:
+        raise RuntimeError(f"Could not find last price in ticker response: {j}")
     return float(last)
 
 def calc_size_from_notional(notional_usdt, mark_price):
-    return round(notional_usdt / mark_price, 6)
+    if mark_price <= 0:
+        raise RuntimeError("Invalid mark_price")
+    size = notional_usdt / mark_price
+    return round(size, 6)
 
-def place_market_order(symbol, side, size, leverage=3):
+# --- Order placement ---
+def place_market_order(symbol, side, size, leverage=3, reduce_only=False):
+    """
+    side should be one of:
+      - "open_long", "open_short", "close_long", "close_short"
+    size = contract size (decimal)
+    """
     endpoint = "/api/mix/v1/order/placeOrder"
     url = BITGET_BASE + endpoint
     body = {
         "symbol": symbol,
         "marginCoin": "USDT",
-        "side": side,  # "buy" or "sell"
+        "side": side,
         "orderType": "market",
         "size": str(size),
         "leverage": str(leverage),
         "productType": "umcbl"
     }
+    # reduceOnly handling - bitget uses 'reduceOnly' in some API versions
+    if reduce_only:
+        body["reduceOnly"] = True
     body_str = json.dumps(body)
     headers = get_headers("POST", endpoint, body_str)
     r = requests.post(url, headers=headers, data=body_str, timeout=15)
-    return r.json()
+    try:
+        return r.json()
+    except Exception:
+        return {"http_status": r.status_code, "text": r.text}
 
-# ====== MAIN ROUTE ======
+# Helper mapping: incoming "buy/sell/long/short" -> actions
+def get_action_for_signal(side_signal):
+    s = side_signal.lower()
+    if s in ("buy", "long"):
+        # want to end up long: first close any short positions, then open long
+        return {"close": "close_short", "open": "open_long"}
+    elif s in ("sell", "short"):
+        return {"close": "close_long", "open": "open_short"}
+    else:
+        return None
+
+# ---------- TradingView webhook route -----------
 @app.route("/webhook", methods=["POST"])
 def webhook():
     try:
-        payload = request.get_json(force=True)
-        symbol = payload.get("symbol")
-        side = payload.get("side", "buy").lower()
-
-        if not symbol:
-            return jsonify({"error": "missing symbol"}), 400
-
-        if side not in ("buy", "sell", "long", "short"):
-            return jsonify({"error": f"invalid side: {side}"}), 400
-        side = "buy" if side in ("buy", "long", "open_long") else "sell"
-
-        # Step 1: Get balance
+        # parse JSON many ways TradingView may send it
         try:
-            balance = fetch_futures_balance(symbol)
-        except Exception as e:
-            app.logger.error("Webhook error: %s", e)
-            return jsonify({"error": "fetch_balance", "detail": str(e)}), 500
+            payload = request.get_json(force=True)
+        except Exception:
+            raw = request.data.decode("utf-8", errors="ignore")
+            try:
+                payload = json.loads(raw)
+            except Exception:
+                return jsonify({"error": "invalid payload", "raw": raw}), 400
 
-        if balance <= 0:
-            return jsonify({"error": "no_balance", "balance": balance}), 400
+        # Expecting something like: {"symbol":"SUIUSDT_UMCBL","side":"buy"}
+        symbol = payload.get("symbol")
+        side_raw = payload.get("side", "buy")
+        if not symbol:
+            return jsonify({"error": "missing symbol in payload", "payload": payload}), 400
 
-        # Step 2: Get mark price
-        mark = fetch_mark_price(symbol)
+        action = get_action_for_signal(side_raw)
+        if action is None:
+            return jsonify({"error": "invalid side", "side": side_raw}), 400
 
-        # Step 3: Compute size & place order
-        leverage = 3
-        notional = round(balance * leverage, 6)
-        size = calc_size_from_notional(notional, mark)
+        # Get configured wallet amount from env (we do NOT query Bitget for balance)
+        if not TRADE_BALANCE_USDT:
+            return jsonify({"error": "TRADE_BALANCE_USDT not set in env"}), 500
+        try:
+            wallet = float(TRADE_BALANCE_USDT)
+        except Exception:
+            return jsonify({"error": "TRADE_BALANCE_USDT invalid float", "value": TRADE_BALANCE_USDT}), 500
 
-        order_resp = place_market_order(symbol, side, size, leverage)
+        leverage = 3  # fixed cross 3x as requested
+        notional_usdt = round(wallet * leverage, 6)
+        if notional_usdt <= 0:
+            return jsonify({"error": "invalid notional calculated", "wallet": wallet}), 400
+
+        # fetch mark price to compute contract size
+        mark_price = fetch_mark_price(symbol)
+        size = calc_size_from_notional(notional_usdt, mark_price)
+        if size <= 0:
+            return jsonify({"error": "calculated zero size", "size": size}), 400
+
+        # 1) Close opposite positions first (reduceOnly)
+        close_side = action["close"]
+        app.logger.info("Closing opposite positions (reduceOnly) for %s using side=%s size=%s", symbol, close_side, size)
+        close_resp = place_market_order(symbol, close_side, size, leverage=leverage, reduce_only=True)
+        app.logger.info("Close response: %s", close_resp)
+
+        # 2) Open requested position
+        open_side = action["open"]
+        app.logger.info("Placing open order for %s side=%s notional=%s size=%s lev=%s", symbol, open_side, notional_usdt, size, leverage)
+        open_resp = place_market_order(symbol, open_side, size, leverage=leverage, reduce_only=False)
+        app.logger.info("Open response: %s", open_resp)
+
         return jsonify({
             "ok": True,
-            "balance": balance,
-            "mark_price": mark,
+            "symbol": symbol,
+            "requested_side": side_raw,
+            "wallet_used_usdt": wallet,
+            "notional_usdt": notional_usdt,
+            "mark_price": mark_price,
             "size": size,
-            "order_resp": order_resp
+            "close_resp": close_resp,
+            "open_resp": open_resp
         })
-
     except Exception as e:
-        app.logger.exception("Webhook failed")
+        app.logger.exception("Webhook processing error")
         return jsonify({"error": "exception", "detail": str(e)}), 500
 
 if __name__ == "__main__":
