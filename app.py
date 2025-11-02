@@ -11,9 +11,9 @@ app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
 
 # ==================== CONFIG ====================
-BITGET_API_KEY = "YOUR_BITGET_API_KEY"
-BITGET_API_SECRET = "YOUR_BITGET_API_SECRET"
-BITGET_PASSPHRASE = "YOUR_BITGET_PASSPHRASE"
+BITGET_API_KEY = "bg_5773fe57167e2e9abb7d87f6510f54b5"
+BITGET_API_SECRET = "cc3a0bc4771b871c989e68068206e9fc12a973350242ea136f34693ee64b69bb"
+BITGET_PASSPHRASE = "automatioN"
 BASE_URL = "https://api.bitget.com"
 LEVERAGE = 3
 MARGIN_MODE = "cross"
