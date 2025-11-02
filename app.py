@@ -1,133 +1,128 @@
 import os
-from flask import Flask, request, jsonify
-import requests
 import hmac
 import hashlib
 import time
+import json
+import requests
+from flask import Flask, request, jsonify
 
 app = Flask(__name__)
 
-BITGET_API_KEY = os.getenv("BITGET_API_KEY")
-BITGET_SECRET_KEY = os.getenv("BITGET_SECRET_KEY")
-BITGET_PASSPHRASE = os.getenv("BITGET_PASSPHRASE")
+# === Environment Variables (set in Render) ===
+API_KEY = os.getenv("BITGET_API_KEY")
+API_SECRET = os.getenv("BITGET_SECRET_KEY")
+PASSPHRASE = os.getenv("BITGET_PASSPHRASE")
 
+# === Bitget API Base ===
 BASE_URL = "https://api.bitget.com"
 
-# --- Helper for Signature ---
-def generate_signature(timestamp, method, request_path, body=""):
-    message = f"{timestamp}{method.upper()}{request_path}{body}"
-    signature = hmac.new(
-        BITGET_SECRET_KEY.encode("utf-8"),
-        message.encode("utf-8"),
-        hashlib.sha256
-    ).hexdigest()
+# === Helper: Signature ===
+def bitget_signature(timestamp, method, request_path, body=""):
+    message = f"{timestamp}{method}{request_path}{body}"
+    signature = hmac.new(API_SECRET.encode('utf-8'),
+                         message.encode('utf-8'),
+                         hashlib.sha256).hexdigest()
     return signature
 
-# --- Bitget API Call ---
+# === Bitget API Request Function ===
 def bitget_request(method, path, body=None):
     timestamp = str(int(time.time() * 1000))
-    body_str = "" if body is None else json.dumps(body)
+    body_str = json.dumps(body) if body else ""
+    sign = bitget_signature(timestamp, method, path, body_str)
+    
     headers = {
-        "ACCESS-KEY": BITGET_API_KEY,
-        "ACCESS-SIGN": generate_signature(timestamp, method, path, body_str),
+        "ACCESS-KEY": API_KEY,
+        "ACCESS-SIGN": sign,
         "ACCESS-TIMESTAMP": timestamp,
-        "ACCESS-PASSPHRASE": BITGET_PASSPHRASE,
+        "ACCESS-PASSPHRASE": PASSPHRASE,
         "Content-Type": "application/json"
     }
+
     url = BASE_URL + path
-    response = requests.request(method, url, headers=headers, data=body_str)
-    return response.json()
 
-# --- Get Available Balance ---
-def get_balance():
-    data = bitget_request("GET", "/api/mix/v1/account/accounts?productType=umcbl")
     try:
-        for acc in data["data"]:
-            if acc["marginCoin"] == "USDT":
-                return float(acc["available"])
-    except:
-        return 0.0
-    return 0.0
+        if method == "POST":
+            response = requests.post(url, headers=headers, data=body_str)
+        else:
+            response = requests.get(url, headers=headers, params=body)
 
-# --- Set Leverage (Cross 3x) ---
-def set_leverage(symbol):
-    body = {
-        "symbol": symbol,
-        "marginCoin": "USDT",
-        "leverage": "3",
-        "holdSide": "long"  # just to set cross for both sides
-    }
-    bitget_request("POST", "/api/mix/v1/account/setLeverage", body)
-    body["holdSide"] = "short"
-    bitget_request("POST", "/api/mix/v1/account/setLeverage", body)
+        print("Bitget response:", response.text)  # DEBUG PRINT
+        return response.json()
+    except Exception as e:
+        print(f"Error while sending Bitget request: {e}")
+        return None
 
-# --- Close All Positions ---
-def close_positions(symbol):
-    positions = bitget_request("GET", f"/api/mix/v1/position/singlePosition?symbol={symbol}&marginCoin=USDT")
-    if "data" in positions and positions["data"]:
-        pos = positions["data"]
-        side = pos["holdSide"]
-        size = abs(float(pos["total"]))
-        if size > 0:
-            opposite = "close_long" if side == "long" else "close_short"
-            body = {
-                "symbol": symbol,
-                "marginCoin": "USDT",
-                "size": str(size),
-                "side": opposite,
-                "orderType": "market"
-            }
-            bitget_request("POST", "/api/mix/v1/order/placeOrder", body)
-
-# --- Place Market Order (Buy/Sell) ---
+# === Place Order ===
 def place_order(symbol, side):
-    balance = get_balance()
-    if balance <= 0:
-        print("⚠️ No available balance.")
-        return {"error": "No balance"}
-    
-    # get current price
-    ticker = bitget_request("GET", f"/api/mix/v1/market/ticker?symbol={symbol}")
-    price = float(ticker["data"]["last"])
-    qty = balance * 3 / price  # use 100% balance with 3x cross
-
-    order_side = "open_long" if side.lower() == "buy" else "open_short"
+    # Market order setup (3x cross leverage, 100% balance usage)
     body = {
         "symbol": symbol,
         "marginCoin": "USDT",
-        "size": str(round(qty, 4)),
-        "side": order_side,
-        "orderType": "market"
+        "side": "open_long" if side == "buy" else "open_short",
+        "orderType": "market",
+        "size": "100%",  # use full available balance
+        "leverage": "3",
+        "marginMode": "cross"
     }
-    print(f"Placing {side.upper()} order on {symbol} for {qty} contracts")
-    return bitget_request("POST", "/api/mix/v1/order/placeOrder", body)
 
-# --- Webhook Endpoint ---
+    print(f"📩 Placing {side.upper()} order on {symbol}")
+    res = bitget_request("POST", "/api/mix/v1/order/placeOrder", body)
+    print("✅ Order Result:", res)
+    return res
+
+
+# === Close All Positions ===
+def close_positions(symbol, side):
+    close_side = "close_long" if side == "sell" else "close_short"
+    body = {
+        "symbol": symbol,
+        "marginCoin": "USDT",
+        "side": close_side,
+        "orderType": "market",
+        "size": "100%",
+        "marginMode": "cross"
+    }
+    print(f"🔻 Closing opposite positions for {symbol}")
+    res = bitget_request("POST", "/api/mix/v1/order/placeOrder", body)
+    print("🧾 Close Result:", res)
+    return res
+
+
+# === Webhook (TradingView Alert Endpoint) ===
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    data = request.get_json()
-    symbol = data.get("symbol")
-    side = data.get("side")
+    data = request.get_json(force=True)
+    print("Alert received:", data)
 
-    if not symbol or not side:
-        return jsonify({"error": "Invalid alert format"}), 400
+    try:
+        symbol = data.get("symbol")
+        side = data.get("side")
 
-    print(f"📩 Received signal: {side.upper()} for {symbol}")
+        if not symbol or not side:
+            return jsonify({"error": "Invalid alert data"}), 400
 
-    # Apply cross 3x leverage
-    set_leverage(symbol)
+        # If BUY — close short, then open long
+        if side.lower() == "buy":
+            close_positions(symbol, "buy")
+            place_order(symbol, "buy")
 
-    # Close opposite positions before new trade
-    close_positions(symbol)
+        # If SELL — close long, then open short
+        elif side.lower() == "sell":
+            close_positions(symbol, "sell")
+            place_order(symbol, "sell")
 
-    # Place new market order
-    result = place_order(symbol, side)
+        return jsonify({"message": "Order executed"}), 200
 
-    return jsonify(result)
+    except Exception as e:
+        print("Error in webhook:", str(e))
+        return jsonify({"error": str(e)}), 500
+
 
 @app.route("/", methods=["GET"])
 def home():
-    return "🚀 Bitget TradingView Futures Bot is Live!"
+    return "Bitget Trading Bot is live 🚀"
+
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)
+
