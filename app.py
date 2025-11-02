@@ -1,144 +1,76 @@
+from flask import Flask, jsonify, request
+from dotenv import load_dotenv
 import os
-import json
-import logging
-from flask import Flask, request, jsonify
-import requests
-from datetime import datetime
-from bitget import Bitget
+from bitget.bitget_api import BitgetApi
 
-# ===================== CONFIG =====================
-API_KEY = os.getenv("BITGET_API_KEY")
-API_SECRET = os.getenv("BITGET_API_SECRET")
-API_PASSPHRASE = os.getenv("BITGET_API_PASSPHRASE")
+# Load environment variables
+load_dotenv()
 
-# 3× cross leverage setup
-LEVERAGE = 3
-MARGIN_MODE = "cross"  # or "isolated" if you want later
-
-# Flask app
 app = Flask(__name__)
 
-# Logging setup
-logging.basicConfig(level=logging.INFO)
+# ====================================
+# ✅ Your Bitget API keys go here
+# (for security, you can also set them in Render → Environment)
+# ====================================
+API_KEY = os.getenv("BITGET_API_KEY", "bg_5773fe57167e2e9abb7d87f6510f54b5")
+API_SECRET = os.getenv("BITGET_API_SECRET", "cc3a0bc4771b871c989e68068206e9fc12a973350242ea136f34693ee64b69bb")
+API_PASS = os.getenv("BITGET_API_PASSPHRASE", "automatioN")
 
-# Bitget client
-bitget = Bitget(
-    api_key=API_KEY,
-    api_secret=API_SECRET,
-    passphrase=API_PASSPHRASE
-)
+# ====================================
+# ✅ Initialize Bitget API client
+# ====================================
+bitget = BitgetApi(api_key=API_KEY, secret_key=API_SECRET, passphrase=API_PASS)
 
-# ===================================================
+@app.route('/')
+def home():
+    return jsonify({"status": "Bitget Futures Bot is running!"})
 
-def get_available_balance():
-    """Fetch USDT-M futures available balance safely."""
+# ====================================
+# ✅ Endpoint to place a Futures Order
+# ====================================
+@app.route('/order', methods=['POST'])
+def order():
     try:
-        # ✅ Correct endpoint for USDT-M futures
-        response = bitget.get(
-            "/api/mix/v1/account/account",
-            params={"symbol": "BTCUSDT_UMCBL"}
+        data = request.json
+        symbol = data.get('symbol', 'BTCUSDT_UMCBL')
+        side = data.get('side', 'buy')
+        size = data.get('size', 0.01)
+        price = data.get('price', None)  # market order if None
+        leverage = data.get('leverage', 3)
+
+        # Set leverage
+        bitget.mix_account_set_leverage(symbol=symbol, marginCoin="USDT", leverage=str(leverage), holdSide=side)
+
+        # Place order
+        order = bitget.mix_order_place(
+            symbol=symbol,
+            marginCoin="USDT",
+            size=str(size),
+            side=side,
+            orderType="market" if price is None else "limit",
+            price=str(price) if price else "",
+            timeInForceValue="normal"
         )
 
-        if response and response.get("code") == "00000":
-            balance_data = response.get("data", {})
-            available = float(balance_data.get("available", 0))
-            logging.info(f"💰 Available futures balance: {available} USDT")
-            return available
-        else:
-            logging.error(f"⚠️ Invalid or empty balance response: {response}")
-            return 0
-
+        return jsonify({"status": "success", "order": order})
     except Exception as e:
-        logging.error(f"❌ Error fetching futures balance: {e}")
-        return 0
+        return jsonify({"status": "error", "message": str(e)})
 
-
-def set_leverage(symbol):
-    """Set 3× cross leverage."""
+# ====================================
+# ✅ Endpoint to get account balance
+# ====================================
+@app.route('/balance', methods=['GET'])
+def balance():
     try:
-        payload = {
-            "symbol": symbol,
-            "marginMode": MARGIN_MODE,
-            "leverage": str(LEVERAGE)
-        }
-        response = bitget.post("/api/mix/v1/account/setLeverage", body=payload)
-        logging.info(f"🔧 Leverage set response: {response}")
+        balances = bitget.mix_account_accounts(productType="UMCBL")
+        return jsonify(balances)
     except Exception as e:
-        logging.error(f"❌ Error setting leverage: {e}")
+        return jsonify({"status": "error", "message": str(e)})
 
+# ====================================
+# ✅ Flask app runner
+# ====================================
+if __name__ == '__main__':
+    port = int(os.environ.get('PORT', 5000))
+    app.run(host='0.0.0.0', port=port)
 
-def place_order(symbol, side, balance):
-    """Open order using 3× available balance."""
-    try:
-        # Use 100% of balance × 3× leverage
-        order_value = balance * LEVERAGE
-        logging.info(f"🚀 Using order size = {order_value:.2f} USDT (3× of {balance:.2f})")
-
-        # Fetch mark price for entry estimation
-        ticker_resp = bitget.get("/api/mix/v1/market/ticker", params={"symbol": symbol})
-        mark_price = float(ticker_resp.get("data", {}).get("last", 0))
-        if not mark_price:
-            logging.warning(f"⚠️ Failed to get price for {symbol}")
-            return
-
-        # Calculate size
-        size = round(order_value / mark_price, 3)
-        logging.info(f"📏 Position size: {size} {symbol.split('_')[0]} at ~{mark_price}")
-
-        # Prepare payload
-        payload = {
-            "symbol": symbol,
-            "marginMode": MARGIN_MODE,
-            "side": "open_long" if side == "buy" else "open_short",
-            "orderType": "market",
-            "size": str(size),
-            "reduceOnly": False
-        }
-
-        # Send order
-        order_resp = bitget.post("/api/mix/v1/order/placeOrder", body=payload)
-        logging.info(f"📨 Order response: {order_resp}")
-
-    except Exception as e:
-        logging.error(f"❌ Error placing order: {e}")
-
-
-@app.route("/webhook", methods=["POST"])
-def webhook():
-    """Handle TradingView alerts."""
-    try:
-        data = request.get_json()
-        logging.info(f"📩 Received TradingView alert: {data}")
-
-        symbol = data.get("symbol")
-        side = data.get("side")
-
-        if not symbol or not side:
-            return jsonify({"error": "Missing 'symbol' or 'side'"}), 400
-
-        # Step 1: Fetch balance
-        balance = get_available_balance()
-        if balance <= 0:
-            logging.error("🚫 No available balance or failed to fetch balance.")
-            return jsonify({"error": "No available balance"}), 400
-
-        # Step 2: Set leverage
-        set_leverage(symbol)
-
-        # Step 3: Place order
-        place_order(symbol, side, balance)
-
-        return jsonify({"status": "Order executed"}), 200
-
-    except Exception as e:
-        logging.error(f"❌ Webhook processing error: {e}")
-        return jsonify({"error": str(e)}), 500
-
-
-@app.route("/", methods=["GET"])
-def home():
-    return "✅ Your Bitget Futures Automation Service is live!"
-
-
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000)
