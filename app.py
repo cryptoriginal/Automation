@@ -1,153 +1,119 @@
-import os
-import hmac
-import hashlib
-import base64
-import json
-import time
-import threading
-import requests
 from flask import Flask, request, jsonify
+import requests
+import json
+import logging
 
 app = Flask(__name__)
 
-# ==============================
-# CONFIGURATION
-# ==============================
-BITGET_API_KEY = os.getenv("BITGET_API_KEY", "YOUR_BITGET_API_KEY")
-BITGET_SECRET_KEY = os.getenv("BITGET_SECRET_KEY", "YOUR_BITGET_SECRET_KEY")
-BITGET_PASSPHRASE = os.getenv("BITGET_PASSPHRASE", "YOUR_BITGET_PASSPHRASE")
-BITGET_BASE_URL = "https://api.bitget.com"
+# Enable logging to Render logs
+logging.basicConfig(level=logging.INFO)
 
-# ==============================
-# SIGNATURE FUNCTION
-# ==============================
-def generate_signature(timestamp, method, request_path, body=""):
-    if not body:
-        body = ""
-    message = f"{timestamp}{method}{request_path}{body}"
-    mac = hmac.new(BITGET_SECRET_KEY.encode(), message.encode(), hashlib.sha256)
-    return base64.b64encode(mac.digest()).decode()
+# ==== CONFIG ====
+BITGET_API_KEY = "YOUR_BITGET_API_KEY"
+BITGET_API_SECRET = "YOUR_BITGET_API_SECRET"
+BITGET_API_PASSPHRASE = "YOUR_BITGET_API_PASSPHRASE"
+BITGET_API_URL = "https://api.bitget.com/api/mix/v1/order/placeOrder"
 
-# ==============================
-# API REQUEST WRAPPER
-# ==============================
-def send_signed_request(method, path, body=None):
-    url = BITGET_BASE_URL + path
-    timestamp = str(int(time.time() * 1000))
-    body_json = json.dumps(body) if body else ""
-    sign = generate_signature(timestamp, method, path, body_json)
+# ==== ROUTES ====
 
-    headers = {
-        "ACCESS-KEY": BITGET_API_KEY,
-        "ACCESS-SIGN": sign,
-        "ACCESS-TIMESTAMP": timestamp,
-        "ACCESS-PASSPHRASE": BITGET_PASSPHRASE,
-        "Content-Type": "application/json",
-    }
+@app.route('/')
+def home():
+    return "🚀 Bitget Webhook Automation is Live!"
 
-    try:
-        if method == "POST":
-            r = requests.post(url, headers=headers, data=body_json)
-        else:
-            r = requests.get(url, headers=headers)
-        return r.json()
-    except Exception as e:
-        app.logger.error(f"Request failed: {e}")
-        return None
-
-# ==============================
-# TRADING FUNCTIONS
-# ==============================
-def close_positions(symbol, side):
-    """Close opposite positions first"""
-    try:
-        close_side = "close_short" if side == "buy" else "close_long"
-        payload = {"symbol": symbol, "marginCoin": "USDT", "side": close_side}
-        result = send_signed_request("POST", "/api/mix/v1/order/close-positions", payload)
-        app.logger.info(f"🧹 Close Result: {result}")
-        return result
-    except Exception as e:
-        app.logger.error(f"Error closing positions: {e}")
-        return None
-
-def place_order(symbol, side):
-    """Open new position"""
-    try:
-        order_side = "open_long" if side == "buy" else "open_short"
-        payload = {
-            "symbol": symbol,
-            "marginCoin": "USDT",
-            "side": order_side,
-            "orderType": "market",
-            "leverage": "3",
-            "size": "1"
-        }
-        result = send_signed_request("POST", "/api/mix/v1/order/placeOrder", payload)
-        app.logger.info(f"🚀 Order Result: {result}")
-        return result
-    except Exception as e:
-        app.logger.error(f"Error placing order: {e}")
-        return None
-
-# ==============================
-# WEBHOOK ENDPOINT
-# ==============================
-@app.route("/webhook", methods=["POST"])
+@app.route('/webhook', methods=['POST'])
 def webhook():
     try:
-        data = request.get_json()
-        app.logger.info(f"📩 Alert received: {data}")
+        content_type = request.headers.get('Content-Type', '')
 
-        symbol = data.get("symbol")
-        side = data.get("side")
+        # Handle JSON alerts (preferred)
+        if 'application/json' in content_type:
+            data = request.get_json(force=True)
+        else:
+            # Handle plain text alert (from TradingView without JSON mode)
+            raw = request.data.decode('utf-8').strip()
+            logging.info(f"Received non-JSON alert: {raw}")
+            data = parse_plain_text_alert(raw)
 
-        if not symbol or side not in ["buy", "sell"]:
-            return jsonify({"error": "Invalid alert format"}), 400
+        if not data or 'symbol' not in data or 'side' not in data:
+            logging.error(f"Invalid alert data: {data}")
+            return jsonify({"status": "error", "message": "Invalid alert data"}), 400
 
-        # Step 1: Close opposite side
-        app.logger.info(f"🔄 Closing opposite positions for {symbol}")
-        close_positions(symbol, side)
+        symbol = data['symbol']
+        side = data['side'].lower()
 
-        # Step 2: Place new order
-        app.logger.info(f"💥 Placing {side.upper()} order on {symbol}")
-        place_order(symbol, side)
+        logging.info(f"✅ Webhook received: {symbol} - {side}")
 
-        return jsonify({"status": "success"}), 200
+        # Simulate Bitget trade placement
+        result = execute_bitget_trade(symbol, side)
+
+        return jsonify({"status": "success", "result": result}), 200
+
     except Exception as e:
-        app.logger.error(f"Webhook error: {e}")
-        return jsonify({"error": str(e)}), 500
+        logging.error(f"❌ ERROR in webhook: {e}")
+        return jsonify({"status": "error", "message": str(e)}), 500
 
-# ==============================
-# TEST SIGNATURE (runs in background)
-# ==============================
-def test_signature_on_startup():
-    try:
-        time.sleep(2)
-        app.logger.info("===================================")
-        app.logger.info("🔍 Testing Bitget Signature...")
-        timestamp = str(int(time.time() * 1000))
-        sign = generate_signature(timestamp, "GET", "/api/mix/v1/market/contracts?productType=umcbl", "")
-        app.logger.info("✅ Signature generated successfully!")
-        app.logger.info(f"Timestamp: {timestamp}")
-        app.logger.info(f"Example request: /api/mix/v1/market/contracts?productType=umcbl")
-        app.logger.info(f"Signature (first 50 chars): {sign[:50]}...")
-        app.logger.info(f"Passphrase: {BITGET_PASSPHRASE}")
-        app.logger.info("===================================")
-    except Exception as e:
-        app.logger.error(f"Signature test failed: {e}")
 
-# ==============================
-# ROOT ENDPOINT
-# ==============================
-@app.route("/", methods=["GET"])
-def home():
-    return jsonify({"status": "running", "service": "Bitget Auto Trader"}), 200
+# ==== HELPERS ====
 
-# ==============================
-# MAIN ENTRY
-# ==============================
-if __name__ == "__main__":
-    threading.Thread(target=test_signature_on_startup).start()
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host="0.0.0.0", port=port)
+def parse_plain_text_alert(text):
+    """Parses alerts like: 'symbol=SUIUSDT_UMCBL, side=buy' or 'SUIUSDT_UMCBL buy'"""
+    text = text.replace("\n", " ").strip().lower()
+    symbol, side = None, None
+
+    # Method 1: key=value pairs
+    if "symbol=" in text:
+        parts = [p.strip() for p in text.split(",")]
+        for p in parts:
+            if "symbol=" in p:
+                symbol = p.split("=")[1].strip().upper()
+            elif "side=" in p:
+                side = p.split("=")[1].strip().lower()
+
+    # Method 2: space-separated
+    elif "buy" in text or "sell" in text:
+        parts = text.split()
+        for p in parts:
+            if "usdt" in p:
+                symbol = p.upper()
+            elif p in ["buy", "sell"]:
+                side = p.lower()
+
+    return {"symbol": symbol, "side": side} if symbol and side else None
+
+
+def execute_bitget_trade(symbol, side):
+    """Simulate order placement. Replace with real Bitget API logic later."""
+    logging.info(f"🚀 Executing {side.upper()} order for {symbol} on Bitget...")
+
+    # Example payload
+    payload = {
+        "symbol": symbol,
+        "marginCoin": "USDT",
+        "side": "open_long" if side == "buy" else "open_short",
+        "orderType": "market",
+        "size": "0.1",
+        "leverage": "3"
+    }
+
+    # For testing, we won't actually send to Bitget API yet
+    # You can uncomment the section below after adding API authentication
+
+    # headers = {
+    #     "ACCESS-KEY": BITGET_API_KEY,
+    #     "ACCESS-SIGN": your_signature_function(payload),
+    #     "ACCESS-TIMESTAMP": timestamp,
+    #     "ACCESS-PASSPHRASE": BITGET_API_PASSPHRASE,
+    #     "Content-Type": "application/json"
+    # }
+    #
+    # response = requests.post(BITGET_API_URL, headers=headers, data=json.dumps(payload))
+    # logging.info(f"Bitget Response: {response.text}")
+    #
+    # return response.json()
+
+    return f"Simulated {side.upper()} order for {symbol}"
+
+# ==== RUN APP ====
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=10000)
 
