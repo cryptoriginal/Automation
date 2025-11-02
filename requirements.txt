@@ -2,4 +2,3 @@ Flask
 requests
 gunicorn
 python-dotenv
-bitget-python-sdk-api
