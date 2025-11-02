@@ -38,7 +38,6 @@ def get_headers(method, request_path, body=""):
         "Content-Type": "application/json",
     }
 
-# Get Futures account balance (USDT)
 def get_balance():
     url = f"{BASE_URL}/api/mix/v1/account/accounts?productType=umcbl"
     headers = get_headers("GET", "/api/mix/v1/account/accounts?productType=umcbl")
@@ -49,18 +48,23 @@ def get_balance():
                 return float(acc["available"])
     return 0.0
 
-# Place futures order (cross 3×, full balance)
+def get_latest_price(symbol="SUIUSDT"):
+    url = f"{BASE_URL}/api/mix/v1/market/ticker?symbol={symbol}"
+    res = requests.get(url).json()
+    if "data" in res:
+        return float(res["data"]["last"])
+    return None
+
 def place_order(symbol="SUIUSDT", side="open_long"):
     balance = get_balance()
     if balance <= 0:
         return {"error": "Insufficient balance"}
 
-    notional = balance * 3  # use 3× total balance
+    notional = balance * 3  # 3× leverage
     price = get_latest_price(symbol)
     if not price:
         return {"error": "Unable to fetch price"}
 
-    # calculate quantity based on notional
     quantity = round(notional / price, 2)
 
     url = f"{BASE_URL}/api/mix/v1/order/placeOrder"
@@ -79,24 +83,35 @@ def place_order(symbol="SUIUSDT", side="open_long"):
     res = requests.post(url, headers=headers, json=body).json()
     return res
 
-# Get latest price
-def get_latest_price(symbol="SUIUSDT"):
-    url = f"{BASE_URL}/api/mix/v1/market/ticker?symbol={symbol}"
-    res = requests.get(url).json()
-    if "data" in res:
-        return float(res["data"]["last"])
-    return None
-
 @app.route("/")
 def home():
     return "Bitget Auto Trader is live."
 
-@app.route("/trade", methods=["POST"])
-def trade():
-    data = request.json
-    side = data.get("side", "open_long")  # open_long / open_short
-    result = place_order("SUIUSDT", side)
+# ✅ New webhook endpoint for TradingView
+@app.route("/webhook", methods=["POST"])
+def webhook():
+    data = request.get_json()
+    if not data or "side" not in data:
+        return jsonify({"error": "Invalid payload"}), 400
+
+    side = data["side"].lower()
+    if side == "long":
+        result = place_order("SUIUSDT", "open_long")
+    elif side == "short":
+        result = place_order("SUIUSDT", "open_short")
+    else:
+        return jsonify({"error": "Invalid side"}), 400
+
     return jsonify(result)
+
+# Optional endpoints for testing
+@app.route("/balance")
+def balance():
+    return jsonify({"balance": get_balance()})
+
+@app.route("/price")
+def price():
+    return jsonify({"price": get_latest_price("SUIUSDT")})
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000)
