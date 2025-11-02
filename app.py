@@ -50,12 +50,20 @@ def webhook():
             print("⚠️ Missing symbol or side in alert.")
             return jsonify({"error": "Missing symbol or side"}), 400
 
-        # Build order body
+        # Convert basic buy/sell to Bitget futures sides
+        if side.lower() == "buy":
+            side_value = "open_long"
+        elif side.lower() == "sell":
+            side_value = "open_short"
+        else:
+            print(f"⚠️ Invalid side received: {side}")
+            return jsonify({"error": "Invalid side"}), 400
+
         order = {
             "symbol": symbol,
             "marginCoin": "USDT",
             "size": "0.1",
-            "side": side.lower(),
+            "side": side_value,
             "orderType": "market",
             "timeInForceValue": "normal"
         }
@@ -67,7 +75,6 @@ def webhook():
         response = requests.post(url, headers=headers("POST", path, order), json=order)
         print("📩 Bitget Response:", response.status_code, response.text)
 
-        # Return to TradingView
         return jsonify({"message": "Order sent", "bitget_response": response.json()}), response.status_code
 
     except Exception as e:
