@@ -47,21 +47,30 @@ def headers(method, request_path, body=None):
 # BITGET FUNCTIONS
 # ================================
 def get_balance():
-    """Fetch available USDT balance safely."""
-    endpoint = "/api/mix/v1/account/accounts?productType=umcbl"
+    """Fetch available USDT balance for Futures."""
+    query = "?productType=umcbl"
+    endpoint = f"/api/mix/v1/account/accounts{query}"
+    url = BASE_URL + endpoint
+
     try:
-        resp = requests.get(BASE_URL + endpoint, headers=headers("GET", endpoint))
+        headers_signed = headers("GET", f"/api/mix/v1/account/accounts{query}")
+        resp = requests.get(url, headers=headers_signed)
         data = resp.json()
-        if not data or "data" not in data:
-            logging.error(f"⚠️ Balance fetch failed: {data}")
+        logging.info(f"💰 Balance Response: {data}")
+
+        if not data or "data" not in data or data["data"] is None:
+            logging.error("⚠️ Invalid or empty balance response.")
             return 0.0
+
         for acc in data["data"]:
             if acc.get("marginCoin") == "USDT":
                 return float(acc.get("available", 0))
         return 0.0
+
     except Exception as e:
         logging.error(f"⚠️ Error fetching balance: {str(e)}")
         return 0.0
+
 
 def get_last_price(symbol):
     """Get latest price for given symbol."""
@@ -73,6 +82,7 @@ def get_last_price(symbol):
     except Exception as e:
         logging.error(f"⚠️ Error fetching price: {str(e)}")
         return 0.0
+
 
 def place_order(symbol, side):
     balance = get_balance()
@@ -133,10 +143,13 @@ def webhook():
         logging.error(f"⚠️ Webhook processing error: {str(e)}")
         return jsonify({"error": str(e)}), 500
 
+
 @app.route('/')
 def home():
-    return "🚀 Bitget Auto-Trader is running with 3x cross leverage!"
+    return "🚀 Bitget Auto-Trader running with 3× cross leverage and 100% balance usage!"
+
 
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 10000))
     app.run(host='0.0.0.0', port=port)
+
