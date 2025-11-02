@@ -1,128 +1,155 @@
-import os
+from flask import Flask, request, jsonify
 import hmac
 import hashlib
+import base64
 import time
-import json
 import requests
-from flask import Flask, request, jsonify
+import os
 
 app = Flask(__name__)
 
-# === Environment Variables (set in Render) ===
-API_KEY = os.getenv("BITGET_API_KEY")
-API_SECRET = os.getenv("BITGET_SECRET_KEY")
-PASSPHRASE = os.getenv("BITGET_PASSPHRASE")
+# ==========================================================
+# 🔍 TEST BITGET SIGNATURE WHEN APP STARTS
+# ==========================================================
+def test_bitget_signature():
+    """Verifies that the API key, secret, and passphrase can generate a valid Bitget signature."""
+    API_KEY = os.getenv("BITGET_API_KEY")
+    API_SECRET = os.getenv("BITGET_SECRET_KEY")
+    PASSPHRASE = os.getenv("BITGET_PASSPHRASE")
 
-# === Bitget API Base ===
-BASE_URL = "https://api.bitget.com"
+    print("\n=======================================")
+    print("🔍 Testing Bitget Signature...")
 
-# === Helper: Signature ===
-def bitget_signature(timestamp, method, request_path, body=""):
-    message = f"{timestamp}{method}{request_path}{body}"
-    signature = hmac.new(API_SECRET.encode('utf-8'),
-                         message.encode('utf-8'),
-                         hashlib.sha256).hexdigest()
-    return signature
+    if not API_KEY or not API_SECRET or not PASSPHRASE:
+        print("❌ One or more environment variables are missing!")
+        print("Please set BITGET_API_KEY, BITGET_SECRET_KEY, and BITGET_PASSPHRASE in Render.")
+        print("=======================================\n")
+        return
 
-# === Bitget API Request Function ===
-def bitget_request(method, path, body=None):
+    try:
+        timestamp = str(int(time.time() * 1000))
+        method = "GET"
+        request_path = "/api/mix/v1/market/contracts?productType=umcbl"
+        body = ""
+        message = timestamp + method + request_path + body
+
+        signature = base64.b64encode(
+            hmac.new(API_SECRET.encode("utf-8"), message.encode("utf-8"), hashlib.sha256).digest()
+        ).decode()
+
+        print("✅ Signature generated successfully!")
+        print("Timestamp:", timestamp)
+        print("Example request:", request_path)
+        print("Signature (first 50 chars):", signature[:50] + "...")
+        print("Passphrase:", PASSPHRASE)
+    except Exception as e:
+        print("❌ Error while testing Bitget signature:", e)
+    print("=======================================\n")
+
+test_bitget_signature()
+
+# ==========================================================
+# 🧠 FUNCTION: CREATE BITGET SIGNATURE FOR AUTH REQUESTS
+# ==========================================================
+def bitget_signature(secret, timestamp, method, request_path, body=""):
+    message = timestamp + method + request_path + body
+    mac = hmac.new(secret.encode("utf-8"), message.encode("utf-8"), hashlib.sha256)
+    d = mac.digest()
+    return base64.b64encode(d).decode()
+
+# ==========================================================
+# ⚙️ FUNCTION: SEND ORDER TO BITGET (MARKET ORDER ONLY)
+# ==========================================================
+def place_bitget_order(symbol, side):
+    API_KEY = os.getenv("BITGET_API_KEY")
+    API_SECRET = os.getenv("BITGET_SECRET_KEY")
+    PASSPHRASE = os.getenv("BITGET_PASSPHRASE")
+
+    base_url = "https://api.bitget.com"
+    endpoint = "/api/mix/v1/order/placeOrder"
+    url = base_url + endpoint
+
     timestamp = str(int(time.time() * 1000))
-    body_str = json.dumps(body) if body else ""
-    sign = bitget_signature(timestamp, method, path, body_str)
-    
+    method = "POST"
+
+    # Ensure it's USDT-M perpetuals
+    productType = "umcbl"
+
+    # Market order only, 3x cross
+    body_dict = {
+        "symbol": symbol,
+        "marginMode": "crossed",
+        "marginCoin": "USDT",
+        "side": side,              # "buy" or "sell"
+        "orderType": "market",
+        "size": "0.1",             # You can adjust quantity
+        "leverage": "3",
+        "timeInForceValue": "normal",
+        "reduceOnly": False
+    }
+
+    import json
+    body = json.dumps(body_dict)
+    signature = bitget_signature(API_SECRET, timestamp, method, endpoint, body)
+
     headers = {
         "ACCESS-KEY": API_KEY,
-        "ACCESS-SIGN": sign,
+        "ACCESS-SIGN": signature,
         "ACCESS-TIMESTAMP": timestamp,
         "ACCESS-PASSPHRASE": PASSPHRASE,
         "Content-Type": "application/json"
     }
 
-    url = BASE_URL + path
+    print(f"\n🚀 Placing {side.upper()} order on {symbol} ...")
+    response = requests.post(url, headers=headers, data=body)
 
     try:
-        if method == "POST":
-            response = requests.post(url, headers=headers, data=body_str)
-        else:
-            response = requests.get(url, headers=headers, params=body)
+        resp_json = response.json()
+        print("✅ Order Result:", resp_json)
+    except Exception:
+        print("⚠️ Raw Response:", response.text)
 
-        print("Bitget response:", response.text)  # DEBUG PRINT
-        return response.json()
-    except Exception as e:
-        print(f"Error while sending Bitget request: {e}")
-        return None
+    return response.text
 
-# === Place Order ===
-def place_order(symbol, side):
-    # Market order setup (3x cross leverage, 100% balance usage)
-    body = {
-        "symbol": symbol,
-        "marginCoin": "USDT",
-        "side": "open_long" if side == "buy" else "open_short",
-        "orderType": "market",
-        "size": "100%",  # use full available balance
-        "leverage": "3",
-        "marginMode": "cross"
-    }
+# ==========================================================
+# 🧠 FUNCTION: CLOSE OPPOSITE POSITION FIRST
+# ==========================================================
+def close_opposite_position(symbol, side):
+    opposite = "sell" if side == "buy" else "buy"
+    print(f"▼ Closing opposite positions for {symbol}")
+    place_bitget_order(symbol, opposite)
 
-    print(f"📩 Placing {side.upper()} order on {symbol}")
-    res = bitget_request("POST", "/api/mix/v1/order/placeOrder", body)
-    print("✅ Order Result:", res)
-    return res
-
-
-# === Close All Positions ===
-def close_positions(symbol, side):
-    close_side = "close_long" if side == "sell" else "close_short"
-    body = {
-        "symbol": symbol,
-        "marginCoin": "USDT",
-        "side": close_side,
-        "orderType": "market",
-        "size": "100%",
-        "marginMode": "cross"
-    }
-    print(f"🔻 Closing opposite positions for {symbol}")
-    res = bitget_request("POST", "/api/mix/v1/order/placeOrder", body)
-    print("🧾 Close Result:", res)
-    return res
-
-
-# === Webhook (TradingView Alert Endpoint) ===
-@app.route("/webhook", methods=["POST"])
+# ==========================================================
+# 📩 WEBHOOK: RECEIVE ALERT FROM TRADINGVIEW
+# ==========================================================
+@app.route('/webhook', methods=['POST'])
 def webhook():
-    data = request.get_json(force=True)
-    print("Alert received:", data)
-
     try:
-        symbol = data.get("symbol")
-        side = data.get("side")
+        data = request.get_json()
+        print("📩 Alert received:", data)
+
+        symbol = data.get('symbol')
+        side = data.get('side')
 
         if not symbol or not side:
-            return jsonify({"error": "Invalid alert data"}), 400
+            return jsonify({"error": "Missing symbol or side"}), 400
 
-        # If BUY — close short, then open long
-        if side.lower() == "buy":
-            close_positions(symbol, "buy")
-            place_order(symbol, "buy")
+        # Close opposite positions before placing new one
+        close_opposite_position(symbol, side)
 
-        # If SELL — close long, then open short
-        elif side.lower() == "sell":
-            close_positions(symbol, "sell")
-            place_order(symbol, "sell")
+        # Place the actual order
+        place_bitget_order(symbol, side)
 
-        return jsonify({"message": "Order executed"}), 200
+        return jsonify({"status": "ok"}), 200
 
     except Exception as e:
-        print("Error in webhook:", str(e))
+        print("❌ Error in webhook:", e)
         return jsonify({"error": str(e)}), 500
 
-
-@app.route("/", methods=["GET"])
-def home():
-    return "Bitget Trading Bot is live 🚀"
-
-
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=10000)
-
+# ==========================================================
+# 🚀 START APP
+# ==========================================================
+if __name__ == '__main__':
+    port = int(os.environ.get('PORT', 10000))
+    print(f"\n✅ Bot running on port {port}")
+    app.run(host='0.0.0.0', port=port)
