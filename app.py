@@ -4,6 +4,7 @@ import hashlib
 import base64
 import json
 import time
+import threading
 import requests
 from flask import Flask, request, jsonify
 
@@ -21,14 +22,10 @@ BITGET_BASE_URL = "https://api.bitget.com"
 # SIGNATURE FUNCTION
 # ==============================
 def generate_signature(timestamp, method, request_path, body=""):
-    if body == "" or body is None:
+    if not body:
         body = ""
     message = f"{timestamp}{method}{request_path}{body}"
-    mac = hmac.new(
-        BITGET_SECRET_KEY.encode("utf-8"),
-        message.encode("utf-8"),
-        hashlib.sha256,
-    )
+    mac = hmac.new(BITGET_SECRET_KEY.encode(), message.encode(), hashlib.sha256)
     return base64.b64encode(mac.digest()).decode()
 
 # ==============================
@@ -65,18 +62,13 @@ def close_positions(symbol, side):
     """Close opposite positions first"""
     try:
         close_side = "close_short" if side == "buy" else "close_long"
-        payload = {
-            "symbol": symbol,
-            "marginCoin": "USDT",
-            "side": close_side
-        }
+        payload = {"symbol": symbol, "marginCoin": "USDT", "side": close_side}
         result = send_signed_request("POST", "/api/mix/v1/order/close-positions", payload)
         app.logger.info(f"🧹 Close Result: {result}")
         return result
     except Exception as e:
         app.logger.error(f"Error closing positions: {e}")
         return None
-
 
 def place_order(symbol, side):
     """Open new position"""
@@ -126,11 +118,11 @@ def webhook():
         return jsonify({"error": str(e)}), 500
 
 # ==============================
-# TEST SIGNATURE ON STARTUP
+# TEST SIGNATURE (runs in background)
 # ==============================
-@app.before_first_request
-def test_signature():
+def test_signature_on_startup():
     try:
+        time.sleep(2)
         app.logger.info("===================================")
         app.logger.info("🔍 Testing Bitget Signature...")
         timestamp = str(int(time.time() * 1000))
@@ -155,6 +147,7 @@ def home():
 # MAIN ENTRY
 # ==============================
 if __name__ == "__main__":
+    threading.Thread(target=test_signature_on_startup).start()
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
 
