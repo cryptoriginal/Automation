@@ -52,9 +52,9 @@ def make_headers(method, endpoint, body=""):
         "Content-Type": "application/json"
     }
 
-# === Get ALL positions for the symbol ===
+# === Get ALL positions with detailed info ===
 def get_all_positions(symbol):
-    """Get all positions (both long and short) for a symbol"""
+    """Get all positions with detailed information including positionId"""
     try:
         endpoint = f"/api/mix/v1/position/allPosition?symbol={symbol}&marginCoin=USDT"
         url = BASE_URL + endpoint
@@ -69,15 +69,19 @@ def get_all_positions(symbol):
             
             result = []
             for pos in positions:
-                if float(pos.get("total", 0) or 0) > 0:  # Only return positions with size > 0
+                total_size = float(pos.get("total", 0) or 0)
+                if total_size > 0:  # Only return positions with size > 0
                     position_info = {
+                        "positionId": pos.get("positionId"),
                         "holdSide": pos.get("holdSide", "").lower(),
-                        "total": float(pos.get("total", 0) or 0),
+                        "total": total_size,
                         "available": float(pos.get("available", 0) or 0),
                         "symbol": pos.get("symbol"),
-                        "marginCoin": pos.get("marginCoin")
+                        "marginCoin": pos.get("marginCoin"),
+                        "openAvgPrice": pos.get("openAvgPrice"),
+                        "leverage": pos.get("leverage")
                     }
-                    print(f"   - {position_info['holdSide']}: {position_info['total']} (available: {position_info['available']})")
+                    print(f"   - {position_info['holdSide']}: {position_info['total']} (ID: {position_info['positionId']})")
                     result.append(position_info)
             return result
         else:
@@ -86,138 +90,142 @@ def get_all_positions(symbol):
         print("⚠️ Exception in get_all_positions:", e)
     return []
 
-# === Close ALL existing positions with aggressive retry ===
-def close_all_positions(symbol):
-    """Close all existing positions (both long and short) for a symbol"""
-    max_attempts = 5
-    attempt = 0
-    
-    while attempt < max_attempts:
-        attempt += 1
-        print(f"🔄 Closing positions attempt {attempt}/{max_attempts}")
-        
-        positions = get_all_positions(symbol)
-        
-        if not positions:
-            print("✅ No positions to close")
-            return True
-        
-        all_closed = True
-        for pos in positions:
-            if pos["total"] > 0:
-                hold_side = pos["holdSide"]
-                close_side = "close_short" if hold_side == "short" else "close_long"
-                quantity = pos["available"] if pos["available"] > 0 else pos["total"]
-                
-                print(f"🔻 Closing {hold_side} position: {quantity}")
-                
-                if not close_single_position(symbol, close_side, quantity):
-                    all_closed = False
-                    print(f"❌ Failed to close {hold_side} position")
-                else:
-                    print(f"✅ Close order sent for {hold_side} position")
-        
-        # Wait for Bitget to process the close orders
-        print("⏳ Waiting for position closure to process...")
-        time.sleep(5)  # Increased wait time
-        
-        # Check if positions are actually closed
-        remaining_positions = get_all_positions(symbol)
-        if not remaining_positions:
-            print("✅ All positions successfully closed")
-            return True
-        else:
-            print(f"⚠️ Still {len(remaining_positions)} positions remaining, retrying...")
-    
-    print("❌ Failed to close all positions after maximum attempts")
-    return False
-
-def close_single_position(symbol, side_type, qty):
-    """Close a single position"""
+# === Close position by ID (PROPER way in hedge mode) ===
+def close_position_by_id(symbol, position_id, hold_side, quantity):
+    """Close a specific position by ID - this is the correct way in hedge mode"""
     try:
-        endpoint = "/api/mix/v1/order/placeOrder"
+        endpoint = "/api/mix/v1/order/closePositions"
+        
+        # In hedge mode, we use reduceOnly and the specific position side
+        if hold_side == "long":
+            side = "close_long"
+        else:
+            side = "close_short"
+            
         payload = {
             "symbol": symbol,
             "marginCoin": "USDT",
-            "size": str(round(qty, 6)),
-            "side": side_type,
-            "orderType": "market",
-            "timeInForceValue": "normal"
+            "positionId": position_id,
+            "size": str(round(quantity, 6)),
+            "side": side,
+            "orderType": "market"
         }
+        
         body = json.dumps(payload)
         headers = make_headers("POST", endpoint, body)
         url = BASE_URL + endpoint
         r = requests.post(url, headers=headers, data=body, timeout=15)
         response_data = r.json()
         
-        print(f"💥 Close order:", payload)
+        print(f"💥 Closing {hold_side} position ID {position_id}: {quantity}")
         print("🌍 Bitget response:", r.status_code, r.text)
         
         if response_data.get("code") in (0, "0"):
-            print(f"✅ Close order placed successfully")
+            print(f"✅ Position {position_id} close order placed successfully")
             return True
         else:
-            print(f"❌ Close order failed: {response_data.get('msg', 'Unknown error')}")
+            print(f"❌ Position close failed: {response_data.get('msg', 'Unknown error')}")
             return False
                 
     except Exception as e:
-        print(f"❌ Error closing order:", e)
+        print(f"❌ Error closing position {position_id}:", e)
         return False
 
-# === SIMPLIFIED Place order - Close first, then open ===
+# === Close ALL positions using position IDs ===
+def close_all_positions(symbol):
+    """Close all positions using their specific position IDs"""
+    positions = get_all_positions(symbol)
+    
+    if not positions:
+        print("✅ No positions to close")
+        return True
+    
+    print(f"🔄 Closing {len(positions)} positions...")
+    
+    all_closed = True
+    for pos in positions:
+        if not close_position_by_id(symbol, pos["positionId"], pos["holdSide"], pos["available"]):
+            all_closed = False
+            print(f"❌ Failed to close {pos['holdSide']} position")
+        else:
+            print(f"✅ Close order sent for {pos['holdSide']} position")
+    
+    return all_closed
+
+# === Wait and verify positions are closed ===
+def wait_for_positions_closed(symbol, max_wait=20, check_interval=2):
+    """Wait and verify that all positions are closed"""
+    print("⏳ Waiting for positions to close...")
+    
+    for i in range(max_wait // check_interval):
+        positions = get_all_positions(symbol)
+        if not positions:
+            print("✅ All positions confirmed closed!")
+            return True
+        
+        print(f"   Still {len(positions)} positions open, waiting... ({i + 1})")
+        time.sleep(check_interval)
+    
+    print("❌ Positions still open after maximum wait time")
+    return False
+
+# === Place order with PROPER hedge mode handling ===
 def place_order(symbol, side):
     try:
         print(f"🎯 Starting order process for {symbol} - {side}")
-        print("=" * 50)
+        print("=" * 60)
         
         # STEP 1: Check current positions
         print("📊 STEP 1: Checking current positions...")
         current_positions = get_all_positions(symbol)
         if current_positions:
+            print(f"   Found {len(current_positions)} open positions")
             for pos in current_positions:
-                print(f"   📍 Current: {pos['holdSide']} - {pos['total']}")
+                print(f"   📍 {pos['holdSide'].upper()}: {pos['total']} (ID: {pos['positionId']})")
         else:
             print("   📍 No current positions")
         
-        # STEP 2: Close ALL existing positions first (AGGRESSIVE)
+        # STEP 2: Close ALL existing positions using position IDs
         print("\n🔄 STEP 2: Closing ALL existing positions...")
         close_success = close_all_positions(symbol)
         
         if not close_success:
-            print("❌ CRITICAL: Failed to close existing positions, ABORTING trade!")
-            return
+            print("❌ Failed to send close orders for some positions")
         
-        # STEP 3: Wait longer to ensure positions are closed
-        print("\n⏳ STEP 3: Final verification - waiting for system to update...")
-        time.sleep(8)  # Wait even longer for Bitget system
+        # STEP 3: Wait and verify positions are actually closed
+        print("\n⏳ STEP 3: Waiting for positions to close...")
+        positions_closed = wait_for_positions_closed(symbol)
         
-        # STEP 4: Final position check
-        final_check = get_all_positions(symbol)
-        if final_check:
-            print("❌ CRITICAL: Positions still exist after closure, ABORTING!")
-            for pos in final_check:
-                print(f"   ❌ Still open: {pos['holdSide']} - {pos['total']}")
+        if not positions_closed:
+            print("❌ CRITICAL: Positions still exist after closure attempts, ABORTING!")
             return
         
         print("✅ SUCCESS: All positions confirmed closed!")
         
-        # STEP 5: Compute trade size
+        # STEP 4: Compute trade size
         trade_size = round(TRADE_BALANCE * 3, 6)
         if trade_size <= 0:
             print("❌ Trade size is zero — set TRADE_BALANCE_USDT env var to >0")
             return
 
-        # STEP 6: Place the new order
-        print(f"\n📈 STEP 4: Placing NEW {side} order...")
+        # STEP 5: Place the new order
+        print(f"\n📈 STEP 4: Placing NEW {side.upper()} order...")
         endpoint = "/api/mix/v1/order/placeOrder"
+        
+        if side.lower() == "buy":
+            order_side = "open_long"
+        else:
+            order_side = "open_short"
+            
         payload = {
             "symbol": symbol,
             "marginCoin": "USDT",
             "size": str(trade_size),
-            "side": "open_long" if side.lower() == "buy" else "open_short",
+            "side": order_side,
             "orderType": "market",
             "timeInForceValue": "normal"
         }
+        
         body = json.dumps(payload)
         headers = make_headers("POST", endpoint, body)
         url = BASE_URL + endpoint
@@ -230,20 +238,20 @@ def place_order(symbol, side):
         if response_data.get("code") in (0, "0"):
             print("✅✅✅ NEW ORDER PLACED SUCCESSFULLY!")
             
-            # Final verification after order
-            print("\n🔍 Final position check after new order...")
-            time.sleep(5)
+            # Final check
+            print("\n🔍 Final position check...")
+            time.sleep(3)
             final_positions = get_all_positions(symbol)
             if final_positions:
                 for pos in final_positions:
-                    print(f"   ✅ Final: {pos['holdSide']} - {pos['total']}")
+                    print(f"   ✅ Final position: {pos['holdSide'].upper()} - {pos['total']}")
             else:
-                print("   ⚠️ No positions found after order placement")
+                print("   ⚠️ No positions found - order may still be processing")
                 
         else:
             print("❌ Order failed:", response_data.get('msg', 'Unknown error'))
             
-        print("=" * 50)
+        print("=" * 60)
             
     except Exception as e:
         print("❌ Exception placing order:", e)
@@ -272,7 +280,7 @@ def webhook():
 
 @app.route('/')
 def home():
-    return "✅ Bitget webhook running - AGGRESSIVE Position Management"
+    return "✅ Bitget webhook running - HEDGE MODE Position Management"
 
 @app.route('/position/<symbol>', methods=['GET'])
 def check_position(symbol):
