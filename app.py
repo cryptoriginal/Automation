@@ -1,99 +1,109 @@
 import os
-import hmac
-import hashlib
-import base64
 import json
 import time
+import hmac
+import hashlib
 import requests
 from flask import Flask, request, jsonify
 
 app = Flask(__name__)
 
-# ======== ENVIRONMENT VARIABLES ==========
-BITGET_API_KEY = os.getenv("BITGET_API_KEY")
-BITGET_API_SECRET = os.getenv("BITGET_API_SECRET")
-BITGET_API_PASSPHRASE = os.getenv("BITGET_API_PASSPHRASE")
-TRADE_VALUE = float(os.getenv("TRADE_VALUE", 10))
-BASE_URL = os.getenv("BITGET_BASE_URL", "https://api.bitget.com")
+# ==================================================
+# ✅ Load API keys from environment variables
+# ==================================================
+API_KEY = os.getenv("API_KEY")
+API_SECRET = os.getenv("API_SECRET")
+PASSPHRASE = os.getenv("PASSPHRASE")
 
-# ======== STARTUP LOGS ==========
-print("🔑 API Key loaded:", bool(BITGET_API_KEY))
-print("🧩 API Secret loaded:", bool(BITGET_API_SECRET))
-print("🔐 Passphrase loaded:", bool(BITGET_API_PASSPHRASE))
-
-
-# ======== SIGN FUNCTION ==========
-def sign_request(timestamp, method, request_path, body=""):
-    if body:
-        body = json.dumps(body, separators=(',', ':'))
-    message = f"{timestamp}{method.upper()}{request_path}{body}"
-    signature = hmac.new(
-        BITGET_API_SECRET.encode('utf-8'),
-        message.encode('utf-8'),
-        hashlib.sha256
-    ).digest()
-    return base64.b64encode(signature).decode()
-
-
-# ======== ORDER FUNCTION ==========
-def place_order(symbol, side):
-    url_path = "/api/mix/v1/order/placeOrder"
+# ==================================================
+# ✅ Helper: Bitget Signature
+# ==================================================
+def sign_request(api_key, api_secret, passphrase, method, request_path, body=None):
     timestamp = str(int(time.time() * 1000))
-
-    # Calculate position size = 3x TRADE_VALUE
-    notional = TRADE_VALUE * 3
-    size = round(notional / 100, 3)  # approximate, can fine-tune later
-
-    order_data = {
-        "symbol": symbol,
-        "marginCoin": "USDT",
-        "side": "open_long" if side == "buy" else "open_short",
-        "orderType": "market",
-        "size": size
-    }
-
-    signature = sign_request(timestamp, "POST", url_path, order_data)
-
+    body_str = json.dumps(body) if body else ""
+    pre_sign = timestamp + method.upper() + request_path + body_str
+    signature = hmac.new(api_secret.encode("utf-8"), pre_sign.encode("utf-8"), hashlib.sha256).hexdigest()
     headers = {
-        "ACCESS-KEY": BITGET_API_KEY,
+        "ACCESS-KEY": api_key,
         "ACCESS-SIGN": signature,
         "ACCESS-TIMESTAMP": timestamp,
-        "ACCESS-PASSPHRASE": BITGET_API_PASSPHRASE,
+        "ACCESS-PASSPHRASE": passphrase,
         "Content-Type": "application/json"
     }
+    return headers
 
-    print("➡️ Sending order:", order_data)
-    response = requests.post(BASE_URL + url_path, headers=headers, json=order_data)
-    print("📨 Response:", response.text)
-    return response.json()
-
-
-# ======== FLASK ROUTES ==========
+# ==================================================
+# ✅ Home Route
+# ==================================================
 @app.route('/')
 def home():
-    return "✅ Bitget Trading Bot is running!"
+    return "🚀 Automation Service is Live — Bitget Trade Webhook Ready!"
 
+# ==================================================
+# ✅ TradingView Webhook Listener
+# ==================================================
 @app.route('/webhook', methods=['POST'])
 def webhook():
     try:
-        data = request.get_json()
-        print("📩 Received alert:", data)
+        data = request.get_json(force=True)
+        print(f"\n📩 Received alert: {data}")
 
-        if not data or 'symbol' not in data or 'side' not in data:
-            return jsonify({"error": "Invalid alert format"}), 400
+        symbol = data.get("symbol")
+        side = data.get("side")
 
-        symbol = data['symbol']
-        side = data['side'].lower()
-        if side not in ['buy', 'sell']:
+        if not symbol or not side:
+            return jsonify({"error": "Missing symbol or side"}), 400
+
+        marginCoin = "USDT"
+        endpoint = "/api/mix/v1/order/placeOrder"
+        url = f"https://api.bitget.com{endpoint}"
+
+        # ✅ Map sides
+        if side.lower() == "buy":
+            orderSide = "open_long"
+        elif side.lower() == "sell":
+            orderSide = "open_short"
+        else:
             return jsonify({"error": "Invalid side"}), 400
 
-        order_response = place_order(symbol, side)
-        return jsonify(order_response)
+        # Example position size (adjust to your need)
+        order = {
+            "symbol": symbol,
+            "marginCoin": marginCoin,
+            "side": orderSide,
+            "orderType": "market",
+            "size": "1"  # 1 contract / coin — adjust as needed
+        }
+
+        headers = sign_request(API_KEY, API_SECRET, PASSPHRASE, "POST", endpoint, order)
+
+        print(f"📤 Sending order: {order}")
+        response = requests.post(url, headers=headers, data=json.dumps(order))
+        print(f"🧾 Response: {response.text}")
+
+        return jsonify(response.json()), response.status_code
 
     except Exception as e:
-        print("❌ Error in webhook:", e)
+        print("❌ Webhook Error:", e)
         return jsonify({"error": str(e)}), 500
 
+# ==================================================
+# ✅ Keepalive Ping for Render
+# ==================================================
+@app.before_request
+def keepalive():
+    if request.path == "/":
+        print("✅ Service alive ping received")
 
+# ==================================================
+# ✅ Run Flask App
+# ==================================================
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=10000)
+    print("🚀 Your service is live 🎉")
+    print("==> Available at your primary URL")
+    print("==>", os.getenv("RENDER_EXTERNAL_URL", "http://localhost:5000"))
+    print("🔑 API Key loaded:", bool(API_KEY))
+    print("🔐 API Secret loaded:", bool(API_SECRET))
+    print("🧩 Passphrase loaded:", bool(PASSPHRASE))
+    app.run(host="0.0.0.0", port=5000)
+
