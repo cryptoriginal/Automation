@@ -52,32 +52,67 @@ def make_headers(method, endpoint, body=""):
         "Content-Type": "application/json"
     }
 
-# === Position fetch (singlePosition) ===
-def get_position(symbol):
-    """Return dict with holdSide ('long'|'short'|'') and total size (float)"""
+# === Get ALL positions for the symbol ===
+def get_all_positions(symbol):
+    """Get all positions (both long and short) for a symbol"""
     try:
-        endpoint = f"/api/mix/v1/position/singlePosition?symbol={symbol}&marginCoin=USDT"
-        url = BASE_URL + "/api/mix/v1/position/singlePosition"
-        # For GET with query we sign request_path as full path + query
-        request_path = f"/api/mix/v1/position/singlePosition?symbol={symbol}&marginCoin=USDT"
+        endpoint = f"/api/mix/v1/position/allPosition?symbol={symbol}&marginCoin=USDT"
+        url = BASE_URL + endpoint
+        request_path = f"/api/mix/v1/position/allPosition?symbol={symbol}&marginCoin=USDT"
         headers = make_headers("GET", request_path, "")
         r = requests.get(url, headers=headers, timeout=10)
         j = r.json()
+        
         if j.get("code") in (0, "0"):
-            d = j.get("data") or {}
-            hold = d.get("holdSide") or None
-            total = float(d.get("total", 0) or 0)
-            available = float(d.get("available", 0) or 0)
-            return {"holdSide": hold, "total": total, "available": available}
-        # If API returns error, return empty
-        print("⚠️ Position fetch returned:", r.status_code, r.text)
+            positions = j.get("data", [])
+            print(f"📊 Found {len(positions)} positions for {symbol}")
+            
+            result = []
+            for pos in positions:
+                position_info = {
+                    "holdSide": pos.get("holdSide", "").lower(),
+                    "total": float(pos.get("total", 0) or 0),
+                    "available": float(pos.get("available", 0) or 0),
+                    "symbol": pos.get("symbol"),
+                    "marginCoin": pos.get("marginCoin")
+                }
+                print(f"   - {position_info['holdSide']}: {position_info['total']} (available: {position_info['available']})")
+                result.append(position_info)
+            return result
+        else:
+            print("⚠️ Position fetch returned:", r.status_code, r.text)
     except Exception as e:
-        print("⚠️ Exception in get_position:", e)
-    return {"holdSide": None, "total": 0.0, "available": 0.0}
+        print("⚠️ Exception in get_all_positions:", e)
+    return []
 
-# === Close position with retry and verification ===
-def close_position(symbol, side_type, qty, max_retries=3):
-    """Close position with retry logic and verification"""
+# === Close ALL existing positions ===
+def close_all_positions(symbol):
+    """Close all existing positions (both long and short) for a symbol"""
+    positions = get_all_positions(symbol)
+    
+    if not positions:
+        print("✅ No existing positions to close")
+        return True
+    
+    success = True
+    for pos in positions:
+        if pos["total"] > 0:
+            hold_side = pos["holdSide"]
+            close_side = "close_short" if hold_side == "short" else "close_long"
+            quantity = pos["available"] if pos["available"] > 0 else pos["total"]
+            
+            print(f"🔻 Closing {hold_side} position: {quantity}")
+            
+            if not close_single_position(symbol, close_side, quantity):
+                success = False
+            else:
+                # Wait a bit after closing to ensure order is processed
+                time.sleep(2)
+    
+    return success
+
+def close_single_position(symbol, side_type, qty, max_retries=3):
+    """Close a single position with retry logic"""
     for attempt in range(max_retries):
         try:
             endpoint = "/api/mix/v1/order/placeOrder"
@@ -100,8 +135,6 @@ def close_position(symbol, side_type, qty, max_retries=3):
             
             if response_data.get("code") in (0, "0"):
                 print(f"✅ Close order placed successfully")
-                # Wait a bit for the close to process
-                time.sleep(2)
                 return True
             else:
                 print(f"❌ Close order failed: {response_data.get('msg', 'Unknown error')}")
@@ -115,76 +148,50 @@ def close_position(symbol, side_type, qty, max_retries=3):
     
     return False
 
-# === Close opposite position with verification ===
-def close_opposite_position(symbol, incoming_side):
-    """Close opposite position and verify it's closed before proceeding"""
-    max_checks = 5
-    check_delay = 1
-    
+# === Verify no positions exist ===
+def verify_no_positions(symbol, max_checks=5, delay=2):
+    """Verify that no positions exist for the symbol"""
     for check in range(max_checks):
-        pos = get_position(symbol)
-        if pos["total"] <= 0:
-            print("✅ No existing position to close")
-            return True
-            
-        hold = (pos["holdSide"] or "").lower()
-        incoming = incoming_side.lower()
+        positions = get_all_positions(symbol)
         
-        print(f"🔍 Position check {check + 1}: holdSide={hold}, total={pos['total']}")
+        # Filter out positions with zero quantity
+        active_positions = [p for p in positions if p["total"] > 0]
         
-        # Check if we need to close opposite position
-        if (incoming == "buy" and hold == "short") or (incoming == "sell" and hold == "long"):
-            print(f"🔄 Closing opposite {hold} position before opening {incoming}")
-            
-            side_type = "close_short" if hold == "short" else "close_long"
-            if close_position(symbol, side_type, pos["available"] if pos["available"] > 0 else pos["total"]):
-                # Verify position is closed
-                time.sleep(check_delay)
-                new_pos = get_position(symbol)
-                if new_pos["total"] <= 0:
-                    print("✅ Opposite position successfully closed")
-                    return True
-                else:
-                    print(f"⚠️ Position still open: {new_pos['total']}, retrying...")
-            else:
-                print("❌ Failed to close opposite position")
-        else:
-            # Same side position exists, no need to close
-            print(f"ℹ️ Existing position is same side ({hold}), no need to close")
+        if not active_positions:
+            print("✅ Verified: No active positions")
             return True
-            
-        time.sleep(check_delay)
+        
+        print(f"⚠️ Still {len(active_positions)} active positions, waiting... (check {check + 1}/{max_checks})")
+        time.sleep(delay)
     
-    print("❌ Failed to close opposite position after multiple attempts")
+    print("❌ Verification failed: Positions still exist after multiple checks")
     return False
 
-# === Place order with improved logic ===
+# === Place order with guaranteed single position ===
 def place_order(symbol, side):
     try:
         print(f"🎯 Starting order process for {symbol} - {side}")
         
-        # 1) Close opposite position and verify
-        if not close_opposite_position(symbol, side):
-            print("❌ Cannot proceed with new order due to position close failure")
+        # 1) Close ALL existing positions first
+        print("🔄 Step 1: Closing all existing positions...")
+        if not close_all_positions(symbol):
+            print("❌ Failed to close some positions, aborting")
             return
-
-        # 2) Compute trade size
+        
+        # 2) Verify all positions are closed
+        print("🔍 Step 2: Verifying all positions are closed...")
+        if not verify_no_positions(symbol):
+            print("❌ Positions still exist after closing, aborting")
+            return
+        
+        # 3) Compute trade size
         trade_size = round(TRADE_BALANCE * 3, 6)
         if trade_size <= 0:
             print("❌ Trade size is zero — set TRADE_BALANCE_USDT env var to >0")
             return
 
-        # 3) Double-check no opposite position exists
-        final_check = get_position(symbol)
-        final_hold = (final_check["holdSide"] or "").lower()
-        incoming = side.lower()
-        
-        # If there's still an opposite position, abort
-        if (incoming == "buy" and final_hold == "short") or (incoming == "sell" and final_hold == "long"):
-            print("❌ Opposite position still exists, aborting order")
-            return
-
         # 4) Place the new order
+        print("📈 Step 3: Placing new order...")
         endpoint = "/api/mix/v1/order/placeOrder"
         payload = {
             "symbol": symbol,
@@ -204,22 +211,30 @@ def place_order(symbol, side):
         
         if response_data.get("code") in (0, "0"):
             print("✅ Order placed successfully!")
+            
+            # Final verification
+            time.sleep(3)
+            final_positions = get_all_positions(symbol)
+            active_final = [p for p in final_positions if p["total"] > 0]
+            print(f"📊 Final position status: {len(active_final)} active positions")
+            
         else:
             print("❌ Order failed:", response_data.get('msg', 'Unknown error'))
             
     except Exception as e:
         print("❌ Exception placing order:", e)
 
-# === Additional endpoint to check current position ===
+# === Additional endpoint to check current positions ===
 @app.route('/position/<symbol>', methods=['GET'])
 def check_position(symbol):
-    """Endpoint to check current position for a symbol"""
-    pos = get_position(symbol)
+    """Endpoint to check current positions for a symbol"""
+    positions = get_all_positions(symbol)
+    active_positions = [p for p in positions if p["total"] > 0]
+    
     return jsonify({
         "symbol": symbol,
-        "holdSide": pos["holdSide"],
-        "total": pos["total"],
-        "available": pos["available"]
+        "active_positions": len(active_positions),
+        "positions": active_positions
     })
 
 # === Webhook ===
@@ -241,7 +256,19 @@ def webhook():
 
 @app.route('/')
 def home():
-    return "✅ Bitget webhook running - Enhanced version with position management"
+    return "✅ Bitget webhook running - Guaranteed Single Position"
+
+@app.route('/close/<symbol>', methods=['POST'])
+def close_positions_endpoint(symbol):
+    """Manual endpoint to close all positions for a symbol"""
+    try:
+        success = close_all_positions(symbol)
+        if success:
+            return jsonify({"status": "success", "message": f"All positions closed for {symbol}"})
+        else:
+            return jsonify({"status": "error", "message": f"Failed to close some positions for {symbol}"})
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 10000)))
