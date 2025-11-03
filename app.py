@@ -69,15 +69,16 @@ def get_all_positions(symbol):
             
             result = []
             for pos in positions:
-                position_info = {
-                    "holdSide": pos.get("holdSide", "").lower(),
-                    "total": float(pos.get("total", 0) or 0),
-                    "available": float(pos.get("available", 0) or 0),
-                    "symbol": pos.get("symbol"),
-                    "marginCoin": pos.get("marginCoin")
-                }
-                print(f"   - {position_info['holdSide']}: {position_info['total']} (available: {position_info['available']})")
-                result.append(position_info)
+                if float(pos.get("total", 0) or 0) > 0:  # Only return positions with size > 0
+                    position_info = {
+                        "holdSide": pos.get("holdSide", "").lower(),
+                        "total": float(pos.get("total", 0) or 0),
+                        "available": float(pos.get("available", 0) or 0),
+                        "symbol": pos.get("symbol"),
+                        "marginCoin": pos.get("marginCoin")
+                    }
+                    print(f"   - {position_info['holdSide']}: {position_info['total']} (available: {position_info['available']})")
+                    result.append(position_info)
             return result
         else:
             print("⚠️ Position fetch returned:", r.status_code, r.text)
@@ -85,113 +86,129 @@ def get_all_positions(symbol):
         print("⚠️ Exception in get_all_positions:", e)
     return []
 
-# === Close ALL existing positions ===
+# === Close ALL existing positions with aggressive retry ===
 def close_all_positions(symbol):
     """Close all existing positions (both long and short) for a symbol"""
-    positions = get_all_positions(symbol)
+    max_attempts = 5
+    attempt = 0
     
-    if not positions:
-        print("✅ No existing positions to close")
-        return True
-    
-    success = True
-    for pos in positions:
-        if pos["total"] > 0:
-            hold_side = pos["holdSide"]
-            close_side = "close_short" if hold_side == "short" else "close_long"
-            quantity = pos["available"] if pos["available"] > 0 else pos["total"]
-            
-            print(f"🔻 Closing {hold_side} position: {quantity}")
-            
-            if not close_single_position(symbol, close_side, quantity):
-                success = False
-            else:
-                # Wait a bit after closing to ensure order is processed
-                time.sleep(2)
-    
-    return success
-
-def close_single_position(symbol, side_type, qty, max_retries=3):
-    """Close a single position with retry logic"""
-    for attempt in range(max_retries):
-        try:
-            endpoint = "/api/mix/v1/order/placeOrder"
-            payload = {
-                "symbol": symbol,
-                "marginCoin": "USDT",
-                "size": str(round(qty, 6)),
-                "side": side_type,
-                "orderType": "market",
-                "timeInForceValue": "normal"
-            }
-            body = json.dumps(payload)
-            headers = make_headers("POST", endpoint, body)
-            url = BASE_URL + endpoint
-            r = requests.post(url, headers=headers, data=body, timeout=15)
-            response_data = r.json()
-            
-            print(f"💥 Close order attempt {attempt + 1}:", payload)
-            print("🌍 Bitget response:", r.status_code, r.text)
-            
-            if response_data.get("code") in (0, "0"):
-                print(f"✅ Close order placed successfully")
-                return True
-            else:
-                print(f"❌ Close order failed: {response_data.get('msg', 'Unknown error')}")
-                
-        except Exception as e:
-            print(f"❌ Error closing order (attempt {attempt + 1}):", e)
+    while attempt < max_attempts:
+        attempt += 1
+        print(f"🔄 Closing positions attempt {attempt}/{max_attempts}")
         
-        # Wait before retry
-        if attempt < max_retries - 1:
-            time.sleep(1)
-    
-    return False
-
-# === Verify no positions exist ===
-def verify_no_positions(symbol, max_checks=5, delay=2):
-    """Verify that no positions exist for the symbol"""
-    for check in range(max_checks):
         positions = get_all_positions(symbol)
         
-        # Filter out positions with zero quantity
-        active_positions = [p for p in positions if p["total"] > 0]
-        
-        if not active_positions:
-            print("✅ Verified: No active positions")
+        if not positions:
+            print("✅ No positions to close")
             return True
         
-        print(f"⚠️ Still {len(active_positions)} active positions, waiting... (check {check + 1}/{max_checks})")
-        time.sleep(delay)
+        all_closed = True
+        for pos in positions:
+            if pos["total"] > 0:
+                hold_side = pos["holdSide"]
+                close_side = "close_short" if hold_side == "short" else "close_long"
+                quantity = pos["available"] if pos["available"] > 0 else pos["total"]
+                
+                print(f"🔻 Closing {hold_side} position: {quantity}")
+                
+                if not close_single_position(symbol, close_side, quantity):
+                    all_closed = False
+                    print(f"❌ Failed to close {hold_side} position")
+                else:
+                    print(f"✅ Close order sent for {hold_side} position")
+        
+        # Wait for Bitget to process the close orders
+        print("⏳ Waiting for position closure to process...")
+        time.sleep(5)  # Increased wait time
+        
+        # Check if positions are actually closed
+        remaining_positions = get_all_positions(symbol)
+        if not remaining_positions:
+            print("✅ All positions successfully closed")
+            return True
+        else:
+            print(f"⚠️ Still {len(remaining_positions)} positions remaining, retrying...")
     
-    print("❌ Verification failed: Positions still exist after multiple checks")
+    print("❌ Failed to close all positions after maximum attempts")
     return False
 
-# === Place order with guaranteed single position ===
+def close_single_position(symbol, side_type, qty):
+    """Close a single position"""
+    try:
+        endpoint = "/api/mix/v1/order/placeOrder"
+        payload = {
+            "symbol": symbol,
+            "marginCoin": "USDT",
+            "size": str(round(qty, 6)),
+            "side": side_type,
+            "orderType": "market",
+            "timeInForceValue": "normal"
+        }
+        body = json.dumps(payload)
+        headers = make_headers("POST", endpoint, body)
+        url = BASE_URL + endpoint
+        r = requests.post(url, headers=headers, data=body, timeout=15)
+        response_data = r.json()
+        
+        print(f"💥 Close order:", payload)
+        print("🌍 Bitget response:", r.status_code, r.text)
+        
+        if response_data.get("code") in (0, "0"):
+            print(f"✅ Close order placed successfully")
+            return True
+        else:
+            print(f"❌ Close order failed: {response_data.get('msg', 'Unknown error')}")
+            return False
+                
+    except Exception as e:
+        print(f"❌ Error closing order:", e)
+        return False
+
+# === SIMPLIFIED Place order - Close first, then open ===
 def place_order(symbol, side):
     try:
         print(f"🎯 Starting order process for {symbol} - {side}")
+        print("=" * 50)
         
-        # 1) Close ALL existing positions first
-        print("🔄 Step 1: Closing all existing positions...")
-        if not close_all_positions(symbol):
-            print("❌ Failed to close some positions, aborting")
+        # STEP 1: Check current positions
+        print("📊 STEP 1: Checking current positions...")
+        current_positions = get_all_positions(symbol)
+        if current_positions:
+            for pos in current_positions:
+                print(f"   📍 Current: {pos['holdSide']} - {pos['total']}")
+        else:
+            print("   📍 No current positions")
+        
+        # STEP 2: Close ALL existing positions first (AGGRESSIVE)
+        print("\n🔄 STEP 2: Closing ALL existing positions...")
+        close_success = close_all_positions(symbol)
+        
+        if not close_success:
+            print("❌ CRITICAL: Failed to close existing positions, ABORTING trade!")
             return
         
-        # 2) Verify all positions are closed
-        print("🔍 Step 2: Verifying all positions are closed...")
-        if not verify_no_positions(symbol):
-            print("❌ Positions still exist after closing, aborting")
+        # STEP 3: Wait longer to ensure positions are closed
+        print("\n⏳ STEP 3: Final verification - waiting for system to update...")
+        time.sleep(8)  # Wait even longer for Bitget system
+        
+        # STEP 4: Final position check
+        final_check = get_all_positions(symbol)
+        if final_check:
+            print("❌ CRITICAL: Positions still exist after closure, ABORTING!")
+            for pos in final_check:
+                print(f"   ❌ Still open: {pos['holdSide']} - {pos['total']}")
             return
         
-        # 3) Compute trade size
+        print("✅ SUCCESS: All positions confirmed closed!")
+        
+        # STEP 5: Compute trade size
         trade_size = round(TRADE_BALANCE * 3, 6)
         if trade_size <= 0:
             print("❌ Trade size is zero — set TRADE_BALANCE_USDT env var to >0")
             return
 
-        # 4) Place the new order
-        print("📈 Step 3: Placing new order...")
+        # STEP 6: Place the new order
+        print(f"\n📈 STEP 4: Placing NEW {side} order...")
         endpoint = "/api/mix/v1/order/placeOrder"
         payload = {
             "symbol": symbol,
@@ -205,37 +222,31 @@ def place_order(symbol, side):
         headers = make_headers("POST", endpoint, body)
         url = BASE_URL + endpoint
         print("🧾 Sending order payload:", payload)
+        
         r = requests.post(url, headers=headers, data=body, timeout=15)
         response_data = r.json()
         print("🌍 Bitget Response:", r.status_code, r.text)
         
         if response_data.get("code") in (0, "0"):
-            print("✅ Order placed successfully!")
+            print("✅✅✅ NEW ORDER PLACED SUCCESSFULLY!")
             
-            # Final verification
-            time.sleep(3)
+            # Final verification after order
+            print("\n🔍 Final position check after new order...")
+            time.sleep(5)
             final_positions = get_all_positions(symbol)
-            active_final = [p for p in final_positions if p["total"] > 0]
-            print(f"📊 Final position status: {len(active_final)} active positions")
-            
+            if final_positions:
+                for pos in final_positions:
+                    print(f"   ✅ Final: {pos['holdSide']} - {pos['total']}")
+            else:
+                print("   ⚠️ No positions found after order placement")
+                
         else:
             print("❌ Order failed:", response_data.get('msg', 'Unknown error'))
             
+        print("=" * 50)
+            
     except Exception as e:
         print("❌ Exception placing order:", e)
-
-# === Additional endpoint to check current positions ===
-@app.route('/position/<symbol>', methods=['GET'])
-def check_position(symbol):
-    """Endpoint to check current positions for a symbol"""
-    positions = get_all_positions(symbol)
-    active_positions = [p for p in positions if p["total"] > 0]
-    
-    return jsonify({
-        "symbol": symbol,
-        "active_positions": len(active_positions),
-        "positions": active_positions
-    })
 
 # === Webhook ===
 @app.route('/webhook', methods=['POST'])
@@ -248,6 +259,11 @@ def webhook():
         side = data.get("side")
         if not symbol or not side:
             return jsonify({"error": "missing symbol or side"}), 400
+        
+        # Validate side
+        if side.lower() not in ['buy', 'sell']:
+            return jsonify({"error": "side must be 'buy' or 'sell'"}), 400
+            
         place_order(symbol, side)
         return jsonify({"status": "ok"}), 200
     except Exception as e:
@@ -256,7 +272,17 @@ def webhook():
 
 @app.route('/')
 def home():
-    return "✅ Bitget webhook running - Guaranteed Single Position"
+    return "✅ Bitget webhook running - AGGRESSIVE Position Management"
+
+@app.route('/position/<symbol>', methods=['GET'])
+def check_position(symbol):
+    """Endpoint to check current positions for a symbol"""
+    positions = get_all_positions(symbol)
+    return jsonify({
+        "symbol": symbol,
+        "active_positions": len(positions),
+        "positions": positions
+    })
 
 @app.route('/close/<symbol>', methods=['POST'])
 def close_positions_endpoint(symbol):
