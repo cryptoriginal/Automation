@@ -18,7 +18,7 @@ API_PASSPHRASE = os.getenv("BITGET_API_PASSPHRASE")
 TRADE_BALANCE_USDT = float(os.getenv("TRADE_BALANCE_USDT", "100"))
 BASE_URL = "https://api.bitget.com"
 
-# === AUTH SIGNING FUNCTION ===
+# === SIGN FUNCTION ===
 def sign_request(timestamp, method, request_path, body=""):
     if body and isinstance(body, dict):
         body = json.dumps(body, separators=(",", ":"))
@@ -37,17 +37,16 @@ def headers(method, path, body=None):
         "Content-Type": "application/json"
     }
 
-# === BITGET API HELPERS ===
 def bitget_post(path, payload):
     url = BASE_URL + path
-    response = requests.post(url, headers=headers("POST", path, payload), json=payload)
-    if response.status_code != 200:
-        logger.error(f"HTTP {response.status_code}: {response.text}")
-    return response.json()
+    res = requests.post(url, headers=headers("POST", path, payload), json=payload)
+    if res.status_code != 200:
+        logger.error(f"HTTP {res.status_code}: {res.text}")
+    return res.json()
 
 @app.route('/')
 def home():
-    return "✅ Bitget Auto-Trader (SDK-Free) is live"
+    return "✅ Bitget Auto-Trader v2 API is Live"
 
 @app.route('/webhook', methods=['POST'])
 def webhook():
@@ -61,37 +60,37 @@ def webhook():
 
         logger.info(f"🚀 Received {side.upper()} alert for {symbol}")
 
-        # 1️⃣ Set Cross Margin Mode + 3x Leverage
-        bitget_post("/api/mix/v1/account/set-margin-mode", {
+        # 1️⃣ Setup Cross + Leverage
+        bitget_post("/api/v2/mix/account/set-margin-mode", {
             "symbol": symbol,
-            "marginMode": "crossed"
+            "marginMode": "cross"
         })
-        bitget_post("/api/mix/v1/account/set-leverage", {
+        bitget_post("/api/v2/mix/account/set-leverage", {
             "symbol": symbol,
             "marginCoin": "USDT",
-            "leverage": "3"
+            "leverage": "3",
+            "holdSide": side
         })
 
-        # 2️⃣ Force close opposite direction
+        # 2️⃣ Close opposite side (if exists)
         opposite = "short" if side == "buy" else "long"
-        close_payload = {
+        bitget_post("/api/v2/mix/order/close-position", {
             "symbol": symbol,
             "marginCoin": "USDT",
             "holdSide": opposite
-        }
-        bitget_post("/api/mix/v1/order/close-position", close_payload)
-        logger.info(f"🧹 Closed {opposite} position before entering new {side}")
+        })
+        logger.info(f"🧹 Closed {opposite} position before new {side}")
 
-        # 3️⃣ Open new position
-        order_value = TRADE_BALANCE_USDT * 3  # leverage 3x
+        # 3️⃣ Open new market position
+        order_value = TRADE_BALANCE_USDT * 3
         payload = {
             "symbol": symbol,
             "marginCoin": "USDT",
             "side": side,
             "orderType": "market",
-            "size": str(order_value / 10)  # simple qty logic, Bitget adjusts automatically
+            "size": str(order_value / 10)
         }
-        order = bitget_post("/api/mix/v1/order/place-order", payload)
+        order = bitget_post("/api/v2/mix/order/place-order", payload)
 
         logger.info(f"✅ New order placed: {order}")
         return jsonify({"status": "ok", "response": order}), 200
@@ -102,6 +101,6 @@ def webhook():
 
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 10000))
-    logger.info("🚀 Starting Bitget Auto-Trader")
+    logger.info("🚀 Starting Bitget Auto-Trader v2 API")
     app.run(host='0.0.0.0', port=port)
 
