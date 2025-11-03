@@ -9,20 +9,29 @@ from flask import Flask, request, jsonify
 app = Flask(__name__)
 
 # ==================================================
-# ✅ Load API keys from environment variables
+# ✅ Load API Keys
 # ==================================================
 API_KEY = os.getenv("API_KEY")
 API_SECRET = os.getenv("API_SECRET")
 PASSPHRASE = os.getenv("PASSPHRASE")
 
+# Debug print
+print("🔑 API Key loaded:", bool(API_KEY))
+print("🔐 API Secret loaded:", bool(API_SECRET))
+print("🧩 Passphrase loaded:", bool(PASSPHRASE))
+
 # ==================================================
 # ✅ Helper: Bitget Signature
 # ==================================================
 def sign_request(api_key, api_secret, passphrase, method, request_path, body=None):
+    if not api_key or not api_secret or not passphrase:
+        raise ValueError("❌ Missing API credentials. Check your Render Environment Variables.")
+
     timestamp = str(int(time.time() * 1000))
     body_str = json.dumps(body) if body else ""
     pre_sign = timestamp + method.upper() + request_path + body_str
     signature = hmac.new(api_secret.encode("utf-8"), pre_sign.encode("utf-8"), hashlib.sha256).hexdigest()
+
     headers = {
         "ACCESS-KEY": api_key,
         "ACCESS-SIGN": signature,
@@ -40,7 +49,7 @@ def home():
     return "🚀 Automation Service is Live — Bitget Trade Webhook Ready!"
 
 # ==================================================
-# ✅ TradingView Webhook Listener
+# ✅ TradingView Webhook
 # ==================================================
 @app.route('/webhook', methods=['POST'])
 def webhook():
@@ -58,7 +67,6 @@ def webhook():
         endpoint = "/api/mix/v1/order/placeOrder"
         url = f"https://api.bitget.com{endpoint}"
 
-        # ✅ Map sides
         if side.lower() == "buy":
             orderSide = "open_long"
         elif side.lower() == "sell":
@@ -66,13 +74,12 @@ def webhook():
         else:
             return jsonify({"error": "Invalid side"}), 400
 
-        # Example position size (adjust to your need)
         order = {
             "symbol": symbol,
             "marginCoin": marginCoin,
             "side": orderSide,
             "orderType": "market",
-            "size": "1"  # 1 contract / coin — adjust as needed
+            "size": "1"
         }
 
         headers = sign_request(API_KEY, API_SECRET, PASSPHRASE, "POST", endpoint, order)
@@ -96,14 +103,11 @@ def keepalive():
         print("✅ Service alive ping received")
 
 # ==================================================
-# ✅ Run Flask App
+# ✅ Run Flask
 # ==================================================
 if __name__ == "__main__":
     print("🚀 Your service is live 🎉")
     print("==> Available at your primary URL")
     print("==>", os.getenv("RENDER_EXTERNAL_URL", "http://localhost:5000"))
-    print("🔑 API Key loaded:", bool(API_KEY))
-    print("🔐 API Secret loaded:", bool(API_SECRET))
-    print("🧩 Passphrase loaded:", bool(PASSPHRASE))
     app.run(host="0.0.0.0", port=5000)
 
