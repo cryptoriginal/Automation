@@ -1,113 +1,115 @@
 import os
 import json
-import time
 import hmac
+import time
 import hashlib
+import base64
 import requests
 from flask import Flask, request, jsonify
 
 app = Flask(__name__)
 
-# ==================================================
-# ✅ Load API Keys
-# ==================================================
+# === Load Environment Variables ===
 API_KEY = os.getenv("API_KEY")
 API_SECRET = os.getenv("API_SECRET")
 PASSPHRASE = os.getenv("PASSPHRASE")
+TRADE_BALANCE_USDT = float(os.getenv("TRADE_BALANCE_USDT", 20))
 
-# Debug print
-print("🔑 API Key loaded:", bool(API_KEY))
-print("🔐 API Secret loaded:", bool(API_SECRET))
-print("🧩 Passphrase loaded:", bool(PASSPHRASE))
+print("//////////////////////////////////////////////////////////////")
+print("==> Your service is live 🎉")
+print("==>")
+print("==> Available at your primary URL https://automation-777x.onrender.com")
+print("//////////////////////////////////////////////////////////////")
+print(f"🔑 API Key loaded: {bool(API_KEY)}")
+print(f"🔐 API Secret loaded: {bool(API_SECRET)}")
+print(f"🧩 Passphrase loaded: {bool(PASSPHRASE)}")
+print("//////////////////////////////////////////////////////////////")
 
-# ==================================================
-# ✅ Helper: Bitget Signature
-# ==================================================
-def sign_request(api_key, api_secret, passphrase, method, request_path, body=None):
-    if not api_key or not api_secret or not passphrase:
-        raise ValueError("❌ Missing API credentials. Check your Render Environment Variables.")
+# === Bitget Futures API Base URL ===
+BASE_URL = "https://api.bitget.com"
 
-    timestamp = str(int(time.time() * 1000))
-    body_str = json.dumps(body) if body else ""
-    pre_sign = timestamp + method.upper() + request_path + body_str
-    signature = hmac.new(api_secret.encode("utf-8"), pre_sign.encode("utf-8"), hashlib.sha256).hexdigest()
+# === Signature Helper Function ===
+def generate_signature(secret_key, timestamp, method, request_path, body=""):
+    if body is None:
+        body = ""
+    message = f"{timestamp}{method}{request_path}{body}"
+    mac = hmac.new(secret_key.encode('utf-8'), message.encode('utf-8'), hashlib.sha256)
+    return base64.b64encode(mac.digest()).decode('utf-8')
 
-    headers = {
-        "ACCESS-KEY": api_key,
-        "ACCESS-SIGN": signature,
-        "ACCESS-TIMESTAMP": timestamp,
-        "ACCESS-PASSPHRASE": passphrase,
-        "Content-Type": "application/json"
-    }
-    return headers
+# === Place Futures Order ===
+def place_order(symbol, side):
+    try:
+        marginCoin = "USDT"
+        timestamp = str(int(time.time() * 1000))
 
-# ==================================================
-# ✅ Home Route
-# ==================================================
-@app.route('/')
-def home():
-    return "🚀 Automation Service is Live — Bitget Trade Webhook Ready!"
+        if side.lower() == "buy":
+            order_side = "open_long"
+        elif side.lower() == "sell":
+            order_side = "open_short"
+        else:
+            print(f"⚠️ Invalid side: {side}")
+            return jsonify({"error": "Invalid side"}), 400
 
-# ==================================================
-# ✅ TradingView Webhook
-# ==================================================
+        size = round(TRADE_BALANCE_USDT / 18.8, 2)  # Example position sizing logic
+
+        body = {
+            "symbol": symbol,
+            "marginCoin": marginCoin,
+            "side": order_side,
+            "orderType": "market",
+            "size": str(size)
+        }
+
+        body_json = json.dumps(body)
+        request_path = "/api/mix/v1/order/placeOrder"
+        method = "POST"
+
+        signature = generate_signature(API_SECRET, timestamp, method, request_path, body_json)
+
+        headers = {
+            "ACCESS-KEY": API_KEY,
+            "ACCESS-SIGN": signature,
+            "ACCESS-TIMESTAMP": timestamp,
+            "ACCESS-PASSPHRASE": PASSPHRASE,
+            "Content-Type": "application/json",
+            "locale": "en-US"
+        }
+
+        url = BASE_URL + request_path
+        response = requests.post(url, headers=headers, data=body_json)
+        print(f"Response: {response.text}")
+
+        return jsonify(response.json())
+
+    except Exception as e:
+        print(f"🔥 Error placing order: {e}")
+        return jsonify({"error": str(e)}), 500
+
+# === Webhook Endpoint ===
 @app.route('/webhook', methods=['POST'])
 def webhook():
     try:
-        data = request.get_json(force=True)
-        print(f"\n📩 Received alert: {data}")
+        data = request.get_json()
+        print(f"📩 Received alert: {data}")
 
-        symbol = data.get("symbol")
-        side = data.get("side")
+        if not data or 'symbol' not in data or 'side' not in data:
+            print("⚠️ Invalid alert payload")
+            return jsonify({"error": "Invalid alert payload"}), 400
 
-        if not symbol or not side:
-            return jsonify({"error": "Missing symbol or side"}), 400
+        symbol = data['symbol']
+        side = data['side']
 
-        marginCoin = "USDT"
-        endpoint = "/api/mix/v1/order/placeOrder"
-        url = f"https://api.bitget.com{endpoint}"
-
-        if side.lower() == "buy":
-            orderSide = "open_long"
-        elif side.lower() == "sell":
-            orderSide = "open_short"
-        else:
-            return jsonify({"error": "Invalid side"}), 400
-
-        order = {
-            "symbol": symbol,
-            "marginCoin": marginCoin,
-            "side": orderSide,
-            "orderType": "market",
-            "size": "1"
-        }
-
-        headers = sign_request(API_KEY, API_SECRET, PASSPHRASE, "POST", endpoint, order)
-
-        print(f"📤 Sending order: {order}")
-        response = requests.post(url, headers=headers, data=json.dumps(order))
-        print(f"🧾 Response: {response.text}")
-
-        return jsonify(response.json()), response.status_code
+        print(f"🚀 Sending order: {symbol}, {side}")
+        return place_order(symbol, side)
 
     except Exception as e:
-        print("❌ Webhook Error:", e)
+        print(f"❌ Webhook Error: {e}")
         return jsonify({"error": str(e)}), 500
 
-# ==================================================
-# ✅ Keepalive Ping for Render
-# ==================================================
-@app.before_request
-def keepalive():
-    if request.path == "/":
-        print("✅ Service alive ping received")
+# === Keep Alive Route ===
+@app.route('/')
+def home():
+    return "🚀 Bitget Auto Trader is live!"
 
-# ==================================================
-# ✅ Run Flask
-# ==================================================
-if __name__ == "__main__":
-    print("🚀 Your service is live 🎉")
-    print("==> Available at your primary URL")
-    print("==>", os.getenv("RENDER_EXTERNAL_URL", "http://localhost:5000"))
-    app.run(host="0.0.0.0", port=5000)
-
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=10000)
