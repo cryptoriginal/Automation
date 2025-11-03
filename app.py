@@ -1,111 +1,100 @@
 import os
 import time
-import json
 import hmac
 import hashlib
+import base64
+import json
 import requests
 from flask import Flask, request, jsonify
 
 app = Flask(__name__)
 
-# ==================== Load Environment Variables ====================
+# --- Load environment variables ---
 API_KEY = os.getenv("API_KEY")
 API_SECRET = os.getenv("API_SECRET")
 PASSPHRASE = os.getenv("PASSPHRASE")
-TRADE_BALANCE_USDT = float(os.getenv("TRADE_BALANCE_USDT", "0"))
+TRADE_BALANCE = float(os.getenv("TRADE_BALANCE_USDT", "0.0"))
 
-print(f"🔑 API Key loaded: {bool(API_KEY)}")
-print(f"🔐 API Secret loaded: {bool(API_SECRET)}")
-print(f"🧩 Passphrase loaded: {bool(PASSPHRASE)}")
-print(f"💰 Trade Balance (env): {TRADE_BALANCE_USDT}")
+# --- Verify keys loaded ---
+print("🔑 API Key loaded:", bool(API_KEY))
+print("🔒 API Secret loaded:", bool(API_SECRET))
+print("🧩 Passphrase loaded:", bool(PASSPHRASE))
+print("💰 Trade Balance (env):", TRADE_BALANCE)
 
-# ==================== Helper: Bitget Auth Header ====================
-def bitget_signature(timestamp, method, request_path, body_str=""):
-    pre_sign = f"{timestamp}{method}{request_path}{body_str}"
-    signature = hmac.new(API_SECRET.encode("utf-8"), pre_sign.encode("utf-8"), hashlib.sha256).hexdigest()
-    return signature
+BASE_URL = "https://api.bitget.com"
 
-def get_headers(method, endpoint, body=""):
-    timestamp = str(int(time.time() * 1000))
-    signature = bitget_signature(timestamp, method, endpoint, body)
-    return {
-        "ACCESS-KEY": API_KEY,
-        "ACCESS-SIGN": signature,
-        "ACCESS-TIMESTAMP": timestamp,
-        "ACCESS-PASSPHRASE": PASSPHRASE,
-        "Content-Type": "application/json"
-    }
+# === Proper Bitget Signature Function ===
+def bitget_signature(timestamp, method, request_path, body):
+    message = f"{timestamp}{method.upper()}{request_path}{body}"
+    mac = hmac.new(API_SECRET.encode('utf-8'), message.encode('utf-8'), hashlib.sha256)
+    d = mac.digest()
+    return base64.b64encode(d).decode()
 
-# ==================== Place Order Function ====================
+# === Place Order ===
 def place_order(symbol, side):
     try:
-        url = "https://api.bitget.com/api/mix/v1/order/placeOrder"
-        order_side = "open_long" if side.lower() == "buy" else "open_short"
+        print(f"📈 Executing trade for {symbol} ({side})")
 
-        # 3x multiplier
-        trade_value = TRADE_BALANCE_USDT * 3
-        size = round(trade_value / 10, 3)  # approximate size calc, adjust as needed
+        endpoint = "/api/mix/v1/order/placeOrder"
+        url = BASE_URL + endpoint
+
+        margin_coin = "USDT"
+        order_type = "market"
+        trade_size = round((TRADE_BALANCE * 3) / 100, 2)  # 3x of balance %
 
         payload = {
             "symbol": symbol,
-            "marginCoin": "USDT",
-            "size": str(size),
-            "side": order_side,
-            "orderType": "market",
+            "marginCoin": margin_coin,
+            "size": str(trade_size),
+            "side": "open_long" if side.lower() == "buy" else "open_short",
+            "orderType": order_type,
             "timeInForceValue": "normal"
         }
 
-        body_str = json.dumps(payload)
-        headers = get_headers("POST", "/api/mix/v1/order/placeOrder", body_str)
+        body = json.dumps(payload)
+        timestamp = str(int(time.time() * 1000))
+        sign = bitget_signature(timestamp, "POST", endpoint, body)
 
-        print(f"📝 Sending order payload: {payload}")
+        headers = {
+            "ACCESS-KEY": API_KEY,
+            "ACCESS-SIGN": sign,
+            "ACCESS-TIMESTAMP": timestamp,
+            "ACCESS-PASSPHRASE": PASSPHRASE,
+            "Content-Type": "application/json"
+        }
 
-        response = requests.post(url, headers=headers, data=body_str)
-        print(f"🌐 Bitget Response: {response.status_code} | {response.text}")
-
-        if response.status_code == 200:
-            return jsonify({"success": True, "data": response.json()}), 200
-        else:
-            return jsonify({"success": False, "error": response.text}), 400
+        print("🧾 Sending order payload:", payload)
+        response = requests.post(url, headers=headers, data=body)
+        print("🌍 Bitget Response:", response.status_code, response.text)
 
     except Exception as e:
-        print(f"❌ Order placement error: {e}")
-        return jsonify({"error": str(e)}), 500
+        print("❌ Exception placing order:", str(e))
 
-# ==================== Webhook Route ====================
+# === Webhook Endpoint ===
 @app.route('/webhook', methods=['POST'])
 def webhook():
     try:
-        print("📬 Webhook triggered!")
-        print(f"🧾 Raw headers: {dict(request.headers)}")
+        print("🚀 Webhook triggered!")
+        data = request.get_json()
+        print("📩 Received payload:", data)
 
-        # Try to get JSON
-        try:
-            data = request.get_json(force=True, silent=False)
-        except Exception as json_err:
-            print(f"⚠️ JSON parse error: {json_err}")
-            print(f"📦 Raw body: {request.data}")
-            return jsonify({"error": "Invalid JSON", "body": request.data.decode()}), 400
+        symbol = data.get('symbol')
+        side = data.get('side')
 
-        print(f"📩 Received payload: {data}")
+        if not symbol or not side:
+            return jsonify({"error": "Missing symbol or side"}), 400
 
-        if not data or 'symbol' not in data or 'side' not in data:
-            return jsonify({"error": "Missing symbol/side"}), 400
-
-        symbol = data['symbol']
-        side = data['side']
-
-        print(f"🚀 Executing trade for {symbol} ({side})")
-        return place_order(symbol, side)
+        place_order(symbol, side)
+        return jsonify({"status": "success"}), 200
 
     except Exception as e:
-        print(f"❌ Webhook Exception: {e}")
+        print("❌ Webhook Error:", str(e))
         return jsonify({"error": str(e)}), 500
 
-# ==================== Root Route ====================
+# === Root Endpoint ===
 @app.route('/')
 def home():
-    return "✅ Automation bot running!"
+    return "✅ Bitget Trading Webhook is Live"
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=10000)
