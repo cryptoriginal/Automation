@@ -1,104 +1,107 @@
 import os
 import json
+import time
+import hmac
+import hashlib
+import requests
 import logging
 from flask import Flask, request, jsonify
-from bitget.paths.mix_v1_order_place.post import ApiForpost as PlaceOrder
-from bitget.paths.mix_v1_account_set_leverage.post import ApiForpost as SetLeverage
-from bitget.paths.mix_v1_account_set_margin_mode.post import ApiForpost as SetMarginMode
-from bitget import ApiClient, Configuration
-from bitget.apis.mix_api import MixApi
 
 app = Flask(__name__)
-
-# Logging setup
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Load environment variables
+# === ENVIRONMENT VARIABLES ===
 API_KEY = os.getenv("BITGET_API_KEY")
 API_SECRET = os.getenv("BITGET_API_SECRET")
 API_PASSPHRASE = os.getenv("BITGET_API_PASSPHRASE")
 TRADE_BALANCE_USDT = float(os.getenv("TRADE_BALANCE_USDT", "100"))
 BASE_URL = "https://api.bitget.com"
 
-# Connect Bitget client
-configuration = Configuration(
-    host=BASE_URL,
-    api_key=API_KEY,
-    api_secret=API_SECRET,
-    passphrase=API_PASSPHRASE
-)
-client = ApiClient(configuration)
-mix_api = MixApi(client)
+# === AUTH SIGNING FUNCTION ===
+def sign_request(timestamp, method, request_path, body=""):
+    if body and isinstance(body, dict):
+        body = json.dumps(body, separators=(",", ":"))
+    message = f"{timestamp}{method.upper()}{request_path}{body}"
+    mac = hmac.new(API_SECRET.encode(), message.encode(), hashlib.sha256)
+    return mac.hexdigest()
+
+def headers(method, path, body=None):
+    timestamp = str(int(time.time() * 1000))
+    sign = sign_request(timestamp, method, path, body)
+    return {
+        "ACCESS-KEY": API_KEY,
+        "ACCESS-SIGN": sign,
+        "ACCESS-TIMESTAMP": timestamp,
+        "ACCESS-PASSPHRASE": API_PASSPHRASE,
+        "Content-Type": "application/json"
+    }
+
+# === BITGET API HELPERS ===
+def bitget_post(path, payload):
+    url = BASE_URL + path
+    response = requests.post(url, headers=headers("POST", path, payload), json=payload)
+    if response.status_code != 200:
+        logger.error(f"HTTP {response.status_code}: {response.text}")
+    return response.json()
 
 @app.route('/')
 def home():
-    return "✅ Bitget Auto-Trader is live"
+    return "✅ Bitget Auto-Trader (SDK-Free) is live"
 
 @app.route('/webhook', methods=['POST'])
 def webhook():
     try:
         data = json.loads(request.data)
         symbol = data.get('symbol')
-        side = data.get('side').lower()
+        side = data.get('side', '').lower()
 
-        if not symbol or side not in ["buy", "sell"]:
-            return jsonify({"error": "Invalid alert data"}), 400
+        if not symbol or side not in ['buy', 'sell']:
+            return jsonify({'error': 'Invalid payload'}), 400
 
-        logger.info(f"🚀 Received alert: {symbol} - {side}")
+        logger.info(f"🚀 Received {side.upper()} alert for {symbol}")
 
-        # --- Set leverage & margin mode ---
-        try:
-            SetMarginMode(mix_api.api_client).post({
-                "symbol": symbol,
-                "marginMode": "crossed"
-            })
-            SetLeverage(mix_api.api_client).post({
-                "symbol": symbol,
-                "leverage": 3,
-                "marginCoin": "USDT"
-            })
-            logger.info(f"Leverage & margin set: 3x Cross for {symbol}")
-        except Exception as e:
-            logger.warning(f"⚠️ Failed to set leverage/margin: {e}")
+        # 1️⃣ Set Cross Margin Mode + 3x Leverage
+        bitget_post("/api/mix/v1/account/set-margin-mode", {
+            "symbol": symbol,
+            "marginMode": "crossed"
+        })
+        bitget_post("/api/mix/v1/account/set-leverage", {
+            "symbol": symbol,
+            "marginCoin": "USDT",
+            "leverage": "3"
+        })
 
-        # --- Determine direction & force-close opposite ---
-        opposite_side = "sell" if side == "buy" else "buy"
+        # 2️⃣ Force close opposite direction
+        opposite = "short" if side == "buy" else "long"
+        close_payload = {
+            "symbol": symbol,
+            "marginCoin": "USDT",
+            "holdSide": opposite
+        }
+        bitget_post("/api/mix/v1/order/close-position", close_payload)
+        logger.info(f"🧹 Closed {opposite} position before entering new {side}")
 
-        try:
-            # Force-close by sending an opposite order first
-            PlaceOrder(mix_api.api_client).post({
-                "symbol": symbol,
-                "marginCoin": "USDT",
-                "side": opposite_side,
-                "orderType": "market",
-                "size": "1",  # minimal close order
-                "reduceOnly": True
-            })
-            logger.info(f"🧹 Forced closed {opposite_side} position before new entry.")
-        except Exception as e:
-            logger.warning(f"⚠️ Skip close error: {e}")
-
-        # --- Place new trade ---
-        order_value = TRADE_BALANCE_USDT * 3
-        qty = round(order_value / 1, 2)  # placeholder; Bitget auto-calculates by size or margin
-
-        response = PlaceOrder(mix_api.api_client).post({
+        # 3️⃣ Open new position
+        order_value = TRADE_BALANCE_USDT * 3  # leverage 3x
+        payload = {
             "symbol": symbol,
             "marginCoin": "USDT",
             "side": side,
             "orderType": "market",
-            "size": str(qty)
-        })
+            "size": str(order_value / 10)  # simple qty logic, Bitget adjusts automatically
+        }
+        order = bitget_post("/api/mix/v1/order/place-order", payload)
 
-        logger.info(f"✅ Order response: {response}")
-        return jsonify({"message": "Trade executed", "details": response}), 200
+        logger.info(f"✅ New order placed: {order}")
+        return jsonify({"status": "ok", "response": order}), 200
 
     except Exception as e:
-        logger.error(f"Webhook error: {e}")
+        logger.error(f"Error: {e}")
         return jsonify({"error": str(e)}), 500
 
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 10000))
-    logger.info("🚀 Starting Bitget Auto-Trader Service")
+    logger.info("🚀 Starting Bitget Auto-Trader")
     app.run(host='0.0.0.0', port=port)
+
