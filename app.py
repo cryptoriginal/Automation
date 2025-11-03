@@ -9,45 +9,54 @@ from flask import Flask, request, jsonify
 
 app = Flask(__name__)
 
-# Load environment variables
+# ======== ENVIRONMENT VARIABLES ==========
 BITGET_API_KEY = os.getenv("BITGET_API_KEY")
 BITGET_API_SECRET = os.getenv("BITGET_API_SECRET")
 BITGET_API_PASSPHRASE = os.getenv("BITGET_API_PASSPHRASE")
 TRADE_VALUE = float(os.getenv("TRADE_VALUE", 10))
 BASE_URL = os.getenv("BITGET_BASE_URL", "https://api.bitget.com")
 
-# Debugging check
+# ======== STARTUP LOGS ==========
 print("🔑 API Key loaded:", bool(BITGET_API_KEY))
 print("🧩 API Secret loaded:", bool(BITGET_API_SECRET))
 print("🔐 Passphrase loaded:", bool(BITGET_API_PASSPHRASE))
 
-def sign_request(timestamp, method, request_path, body):
-    if not BITGET_API_SECRET:
-        raise ValueError("BITGET_API_SECRET is missing! Check environment variables.")
 
-    body_str = json.dumps(body, separators=(',', ':')) if body else ''
-    message = f"{timestamp}{method.upper()}{request_path}{body_str}"
-    signature = base64.b64encode(
-        hmac.new(BITGET_API_SECRET.encode('utf-8'), message.encode('utf-8'), hashlib.sha256).digest()
-    )
-    return signature.decode()
+# ======== SIGN FUNCTION ==========
+def sign_request(timestamp, method, request_path, body=""):
+    if body:
+        body = json.dumps(body, separators=(',', ':'))
+    message = f"{timestamp}{method.upper()}{request_path}{body}"
+    signature = hmac.new(
+        BITGET_API_SECRET.encode('utf-8'),
+        message.encode('utf-8'),
+        hashlib.sha256
+    ).digest()
+    return base64.b64encode(signature).decode()
 
+
+# ======== ORDER FUNCTION ==========
 def place_order(symbol, side):
     url_path = "/api/mix/v1/order/placeOrder"
     timestamp = str(int(time.time() * 1000))
+
+    # Calculate position size = 3x TRADE_VALUE
     notional = TRADE_VALUE * 3
+    size = round(notional / 100, 3)  # approximate, can fine-tune later
 
     order_data = {
         "symbol": symbol,
         "marginCoin": "USDT",
         "side": "open_long" if side == "buy" else "open_short",
         "orderType": "market",
-        "size": round(notional / 100, 3)
+        "size": size
     }
+
+    signature = sign_request(timestamp, "POST", url_path, order_data)
 
     headers = {
         "ACCESS-KEY": BITGET_API_KEY,
-        "ACCESS-SIGN": sign_request(timestamp, "POST", url_path, order_data),
+        "ACCESS-SIGN": signature,
         "ACCESS-TIMESTAMP": timestamp,
         "ACCESS-PASSPHRASE": BITGET_API_PASSPHRASE,
         "Content-Type": "application/json"
@@ -58,6 +67,8 @@ def place_order(symbol, side):
     print("📨 Response:", response.text)
     return response.json()
 
+
+# ======== FLASK ROUTES ==========
 @app.route('/')
 def home():
     return "✅ Bitget Trading Bot is running!"
@@ -82,6 +93,7 @@ def webhook():
     except Exception as e:
         print("❌ Error in webhook:", e)
         return jsonify({"error": str(e)}), 500
+
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)
