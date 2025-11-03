@@ -9,17 +9,23 @@ from flask import Flask, request, jsonify
 
 app = Flask(__name__)
 
+# Load environment variables
 BITGET_API_KEY = os.getenv("BITGET_API_KEY")
 BITGET_API_SECRET = os.getenv("BITGET_API_SECRET")
 BITGET_API_PASSPHRASE = os.getenv("BITGET_API_PASSPHRASE")
-TRADE_VALUE = float(os.getenv("TRADE_VALUE", 10))  # in USDT
+TRADE_VALUE = float(os.getenv("TRADE_VALUE", 10))
 BASE_URL = os.getenv("BITGET_BASE_URL", "https://api.bitget.com")
 
+# Debugging check
+print("🔑 API Key loaded:", bool(BITGET_API_KEY))
+print("🧩 API Secret loaded:", bool(BITGET_API_SECRET))
+print("🔐 Passphrase loaded:", bool(BITGET_API_PASSPHRASE))
+
 def sign_request(timestamp, method, request_path, body):
-    if body:
-        body_str = json.dumps(body, separators=(',', ':'))
-    else:
-        body_str = ''
+    if not BITGET_API_SECRET:
+        raise ValueError("BITGET_API_SECRET is missing! Check environment variables.")
+
+    body_str = json.dumps(body, separators=(',', ':')) if body else ''
     message = f"{timestamp}{method.upper()}{request_path}{body_str}"
     signature = base64.b64encode(
         hmac.new(BITGET_API_SECRET.encode('utf-8'), message.encode('utf-8'), hashlib.sha256).digest()
@@ -29,14 +35,14 @@ def sign_request(timestamp, method, request_path, body):
 def place_order(symbol, side):
     url_path = "/api/mix/v1/order/placeOrder"
     timestamp = str(int(time.time() * 1000))
-    notional = TRADE_VALUE * 3  # use 3x of your trade value
+    notional = TRADE_VALUE * 3
 
     order_data = {
         "symbol": symbol,
         "marginCoin": "USDT",
         "side": "open_long" if side == "buy" else "open_short",
         "orderType": "market",
-        "size": round(notional / 100, 3)  # approx size (adjust by symbol price)
+        "size": round(notional / 100, 3)
     }
 
     headers = {
@@ -47,8 +53,8 @@ def place_order(symbol, side):
         "Content-Type": "application/json"
     }
 
-    response = requests.post(BASE_URL + url_path, headers=headers, json=order_data)
     print("➡️ Sending order:", order_data)
+    response = requests.post(BASE_URL + url_path, headers=headers, json=order_data)
     print("📨 Response:", response.text)
     return response.json()
 
