@@ -1,4 +1,4 @@
 Flask
-requests
 gunicorn
-python-dotenv
+requests
+bitget-python==1.0.9
