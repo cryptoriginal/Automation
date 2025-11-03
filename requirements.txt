@@ -1,4 +1,4 @@
 Flask
 gunicorn
 requests
-bitget-python-sdk-api
+bitget-python==1.0.4
