@@ -16,10 +16,15 @@ TRADE_BALANCE = float(os.getenv("TRADE_BALANCE_USDT", "25"))
 
 BASE_URL = "https://open-api.bingx.com"
 
-# === BingX Signature ===
+# === CORRECT BingX Signature ===
 def bingx_signature(params, secret_key):
-    query_string = '&'.join([f"{key}={value}" for key, value in params.items()])
-    signature = hmac.new(secret_key.encode('utf-8'), query_string.encode('utf-8'), hashlib.sha256).hexdigest()
+    """Correct BingX signature generation"""
+    query_string = '&'.join([f"{key}={value}" for key, value in sorted(params.items())])
+    signature = hmac.new(
+        secret_key.encode('utf-8'), 
+        query_string.encode('utf-8'), 
+        hashlib.sha256
+    ).hexdigest()
     return signature
 
 def bingx_headers():
@@ -43,6 +48,8 @@ def get_current_position(symbol):
         url = f"{BASE_URL}/openApi/swap/v2/user/positions"
         response = requests.get(url, headers=bingx_headers(), params=params, timeout=10)
         data = response.json()
+        
+        print(f"🔍 Position check response: {data}")
         
         if "data" in data and data["data"]:
             for position in data["data"]:
@@ -70,7 +77,7 @@ def close_position(symbol, side, quantity):
         params = {
             "symbol": symbol,
             "side": close_side,
-            "positionSide": "BOTH",  # For one-way mode
+            "positionSide": "LONG" if side == "LONG" else "SHORT",
             "type": "MARKET",
             "quantity": abs(quantity),
             "timestamp": int(time.time() * 1000)
@@ -104,14 +111,18 @@ def open_position(symbol, side, quantity):
         params = {
             "symbol": symbol,
             "side": side,
-            "positionSide": "BOTH",  # For one-way mode
+            "positionSide": "LONG" if side == "BUY" else "SHORT",
             "type": "MARKET",
             "quantity": quantity,
             "timestamp": int(time.time() * 1000)
         }
         
+        print(f"📝 Order params: {params}")
+        
         signature = bingx_signature(params, SECRET_KEY)
         params["signature"] = signature
+        
+        print(f"🔐 Signature generated")
         
         url = f"{BASE_URL}/openApi/swap/v2/trade/order"
         response = requests.post(url, headers=bingx_headers(), json=params, timeout=15)
@@ -138,21 +149,27 @@ def execute_trade(symbol, action):
     print("=" * 50)
     
     # Calculate trade size (3x leverage)
-    trade_size = round(TRADE_BALANCE * 3, 3)  # BingX uses 3 decimal places
+    trade_size = round(TRADE_BALANCE * 3, 3)
     
     if trade_size <= 0:
         print("❌ Invalid trade size")
         return
     
+    print(f"💰 Trade size: {trade_size} USDT")
+    
     # Get current position
     current_position = get_current_position(symbol)
+    print(f"📊 Current position: {current_position}")
     
     if action.upper() == "BUY":
         # For BUY: Close any existing SHORT position, then open LONG
         if current_position and current_position["side"] == "SHORT":
             print("🔄 Closing SHORT position before opening LONG")
-            close_position(symbol, "SHORT", current_position["quantity"])
-            time.sleep(1)  # Small delay to ensure close is processed
+            if close_position(symbol, "SHORT", current_position["quantity"]):
+                time.sleep(2)  # Wait for close to process
+            else:
+                print("❌ Failed to close SHORT position, aborting")
+                return
         
         print("📈 Opening LONG position")
         open_position(symbol, "BUY", trade_size)
@@ -161,8 +178,11 @@ def execute_trade(symbol, action):
         # For SELL: Close any existing LONG position, then open SHORT
         if current_position and current_position["side"] == "LONG":
             print("🔄 Closing LONG position before opening SHORT")
-            close_position(symbol, "LONG", current_position["quantity"])
-            time.sleep(1)  # Small delay to ensure close is processed
+            if close_position(symbol, "LONG", current_position["quantity"]):
+                time.sleep(2)  # Wait for close to process
+            else:
+                print("❌ Failed to close LONG position, aborting")
+                return
         
         print("📉 Opening SHORT position")
         open_position(symbol, "SELL", trade_size)
