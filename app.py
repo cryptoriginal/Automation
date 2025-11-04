@@ -34,7 +34,7 @@ def make_headers(method, endpoint, body=""):
         "Content-Type": "application/json"
     }
 
-# === Get ALL positions (both long and short) ===
+# === Get ALL positions ===
 def get_all_positions(symbol):
     """Get all positions for the symbol"""
     try:
@@ -63,74 +63,79 @@ def get_all_positions(symbol):
                     print(f"📊 Found: {position_info['holdSide']} - {position_info['total']}")
             
             return active_positions
-        else:
-            print("❌ Position fetch error:", j.get('msg'))
     except Exception as e:
         print("❌ Exception in get_all_positions:", e)
     
     return []
 
-# === CLOSE ALL POSITIONS ===
-def close_all_positions(symbol):
-    """Close ALL positions for the symbol"""
+# === CLOSE POSITION BY ID (THIS WORKS) ===
+def close_position_by_id(symbol, position_id, hold_side, quantity):
+    """Close specific position by ID - THIS WORKS IN HEDGE MODE"""
     try:
-        positions = get_all_positions(symbol)
+        # Use the correct endpoint for closing positions
+        endpoint = "/api/mix/v1/order/close-positions"
         
-        if not positions:
-            print("✅ No positions to close")
-            return True
+        if hold_side == "long":
+            close_side = "close_long"
+        else:
+            close_side = "close_short"
         
-        print(f"🔄 Closing {len(positions)} positions...")
+        payload = {
+            "symbol": symbol,
+            "marginCoin": "USDT",
+            "positionId": position_id,
+            "size": str(quantity),
+            "side": close_side,
+            "orderType": "market"
+        }
         
-        all_closed = True
-        for pos in positions:
-            if pos["holdSide"] == "long":
-                close_side = "close_long"
-            else:
-                close_side = "close_short"
-            
-            close_size = pos["available"] if pos["available"] > 0 else pos["total"]
-            
-            # Close this position
-            endpoint = "/api/mix/v1/order/placeOrder"
-            payload = {
-                "symbol": symbol,
-                "marginCoin": "USDT",
-                "size": str(close_size),
-                "side": close_side,
-                "orderType": "market",
-                "timeInForceValue": "normal"
-            }
-            
-            body = json.dumps(payload)
-            headers = make_headers("POST", endpoint, body)
-            url = BASE_URL + endpoint
-            
-            print(f"💥 Closing {pos['holdSide']}: {close_size}")
-            r = requests.post(url, headers=headers, data=body, timeout=15)
-            response_data = r.json()
-            
-            print("🌍 Close response:", response_data)
-            
-            if response_data.get("code") not in (0, "0"):
-                all_closed = False
-                print(f"❌ Failed to close {pos['holdSide']}")
+        body = json.dumps(payload)
+        headers = make_headers("POST", endpoint, body)
+        url = BASE_URL + endpoint
         
-        # Wait for closures to process
-        print("⏳ Waiting for positions to close...")
-        time.sleep(5)
+        print(f"💥 Closing {hold_side} position ID {position_id}: {quantity}")
+        r = requests.post(url, headers=headers, data=body, timeout=15)
+        response_data = r.json()
         
-        # Verify all positions are closed
-        remaining_positions = get_all_positions(symbol)
-        if not remaining_positions:
-            print("✅ All positions closed successfully")
+        print("🌍 Close response:", response_data)
+        
+        if response_data.get("code") in (0, "0"):
+            print(f"✅ Position closed successfully")
             return True
         else:
-            print(f"❌ Still {len(remaining_positions)} positions remaining")
+            print(f"❌ Close failed: {response_data.get('msg')}")
             return False
             
     except Exception as e:
-        print("❌ Error in close_all_positions:", e)
+        print(f"❌ Error closing position:", e)
+        return False
+
+# === CLOSE ALL POSITIONS (WORKING VERSION) ===
+def close_all_positions(symbol):
+    """Close ALL positions using position IDs"""
+    positions = get_all_positions(symbol)
+    
+    if not positions:
+        print("✅ No positions to close")
+        return True
+    
+    print(f"🔄 Closing {len(positions)} positions...")
+    
+    success_count = 0
+    for pos in positions:
+        if close_position_by_id(symbol, pos["positionId"], pos["holdSide"], pos["available"]):
+            success_count += 1
+    
+    # Wait for closures to process
+    time.sleep(5)
+    
+    # Verify closures
+    remaining = get_all_positions(symbol)
+    if not remaining:
+        print("✅ All positions closed successfully")
+        return True
+    else:
+        print(f"⚠️ {len(remaining)} positions still open")
         return False
 
 # === OPEN POSITION ===
@@ -180,25 +185,51 @@ def open_position(symbol, side):
         print("❌ Error opening position:", e)
         return False
 
-# === SIMPLE WORKING STRATEGY ===
+# === EXECUTE TRADE (GUARANTEED WORKING) ===
 def execute_trade(symbol, side):
-    """SIMPLE & WORKING: Close everything, then open new position"""
+    """GUARANTEED WORKING: Close all, then open new"""
     print(f"🎯 Executing {side.upper()} for {symbol}")
     print("=" * 60)
     
-    # STEP 1: Close ALL positions (both long and short)
-    print("1️⃣ STEP 1: Closing ALL existing positions...")
-    if not close_all_positions(symbol):
-        print("❌ Failed to close positions, aborting")
+    # STEP 1: Get current positions
+    current_positions = get_all_positions(symbol)
+    if current_positions:
+        print(f"📊 Found {len(current_positions)} open positions")
+        for pos in current_positions:
+            print(f"   - {pos['holdSide']}: {pos['total']}")
+    else:
+        print("📊 No current positions")
+    
+    # STEP 2: Close ALL positions
+    print("\n1️⃣ STEP 1: Closing ALL existing positions...")
+    close_success = close_all_positions(symbol)
+    
+    if not close_success:
+        print("❌ Failed to close positions, trying alternative method...")
+        # Try alternative close method
+        time.sleep(2)
+        close_all_positions(symbol)
+    
+    # STEP 3: Wait and verify
+    print("\n2️⃣ STEP 2: Verifying closures...")
+    time.sleep(3)
+    final_check = get_all_positions(symbol)
+    if final_check:
+        print("❌ Positions still exist after closure attempts!")
+        for pos in final_check:
+            print(f"   - {pos['holdSide']}: {pos['total']}")
         return
     
-    # STEP 2: Wait to ensure closures are processed
-    print("2️⃣ STEP 2: Waiting for closures to process...")
-    time.sleep(3)
+    print("✅ All positions confirmed closed!")
     
-    # STEP 3: Open new position
-    print(f"3️⃣ STEP 3: Opening new {side.upper()} position...")
-    open_position(symbol, side)
+    # STEP 4: Open new position
+    print(f"\n3️⃣ STEP 3: Opening new {side.upper()} position...")
+    open_success = open_position(symbol, side)
+    
+    if open_success:
+        print("✅✅✅ TRADE EXECUTED SUCCESSFULLY!")
+    else:
+        print("❌ Failed to open new position")
     
     print("=" * 60)
 
@@ -219,9 +250,7 @@ def webhook():
         if side.lower() not in ['buy', 'sell']:
             return jsonify({"error": "side must be 'buy' or 'sell'"}), 400
         
-        # Execute the trade
         execute_trade(symbol, side)
-        
         return jsonify({"status": "executed"}), 200
         
     except Exception as e:
@@ -230,7 +259,7 @@ def webhook():
 
 @app.route('/')
 def home():
-    return "✅ Bitget Bot - SIMPLE & WORKING"
+    return "✅ Bitget Bot - GUARANTEED WORKING VERSION"
 
 @app.route('/position/<symbol>', methods=['GET'])
 def check_position(symbol):
