@@ -1,289 +1,247 @@
-import os
-import time
+MAX || [C.O.], [04-11-2025 08:31 AM]
 import hmac
 import hashlib
-import base64
+import time
 import json
 import requests
+import base64
 from flask import Flask, request, jsonify
+
+# --- Configuration ---
+# IMPORTANT: Replace these placeholders with your actual API credentials.
+API_KEY = "bg_02bc5dd6473ee2005f097dd625e5e070"
+API_SECRET = "fefb9196995ac05ab7f7e80dbff13a277f5b6992485a5378987ba80eed928a0d"
+API_PASSPHRASE = "automatioN"
+
+# Set your desired leverage (must be pre-set on the exchange, but good practice to include)
+LEVERAGE = "10" 
+# Set the desired size of your trade in base currency (e.g., 0.001 BTC or 0.1 ETH)
+TRADE_SIZE = "0.005"
+# Your TradingView Webhook Secret (must match the secret you set in TV alerts)
+TV_SECRET = "Your_Secret_Webhook_Key" 
+
+# Base URL for Bitget Mix (Futures) API
+BASE_URL = "https://api.bitget.com" 
 
 app = Flask(__name__)
 
-# --- Read env vars with fallback to BITGET_* names if present ---
-API_KEY = os.getenv("API_KEY") or os.getenv("BITGET_API_KEY")
-API_SECRET = os.getenv("API_SECRET") or os.getenv("BITGET_API_SECRET")
-PASSPHRASE = os.getenv("PASSPHRASE") or os.getenv("BITGET_API_PASSPHRASE")
-TRADE_BALANCE = float(os.getenv("TRADE_BALANCE_USDT", os.getenv("TRADE_BALANCE", "0.0")))
+# --- Bitget API Helper Class with V2 Signature Logic ---
+class BitgetAPI:
+    def __init__(self, key, secret, passphrase):
+        self.key = key
+        self.secret = secret
+        self.passphrase = passphrase
 
-# Mask helper (do not print secrets)
-def mask(s):
-    if not s:
-        return "None"
-    if len(s) <= 6:
-        return "***"
-    return s[:3] + "..." + s[-3:]
+    def _generate_signature(self, timestamp, method, request_path, body=None):
+        """Generates the HMAC-SHA256 signature for Bitget API V2."""
+        
+        # 1. Concatenate the data string
+        message = str(timestamp) + str.upper(method) + request_path
+        if body is not None and body != "":
+            message += body
 
-# --- Startup status (visible in logs) ---
-print("🔷 Starting app — environment check")
-print("🔑 API Key loaded:", bool(API_KEY))
-print("🔑 API Key (masked):", mask(API_KEY))
-print("🔒 API Secret loaded:", bool(API_SECRET))
-print("🔒 API Secret (masked):", mask(API_SECRET))
-print("🧩 Passphrase loaded:", bool(PASSPHRASE))
-print("🧩 Passphrase (masked):", mask(PASSPHRASE))
-print("💰 Trade Balance (env):", TRADE_BALANCE)
+        # 2. Hash the message
+        # Convert secret to bytes
+        secret_bytes = self.secret.encode('utf-8')
+        
+        # Generate the HMAC-SHA256 hash
+        signature = hmac.new(secret_bytes, message.encode('utf-8'), hashlib.sha256).digest()
+        
+        # 3. Base64 encode the result
+        return base64.b64encode(signature).decode('utf-8')
 
-BASE_URL = "https://api.bitget.com"
+    def _send_request(self, method, request_path, params=None, body=None):
+        """Helper to send authenticated requests."""
+        timestamp = str(int(time.time() * 1000))
+        
+        body_str = json.dumps(body) if body else ""
+        signature = self._generate_signature(timestamp, method, request_path, body_str)
+        
+        headers = {
+            "Content-Type": "application/json",
+            "ACCESS-KEY": self.key,
+            "ACCESS-SIGN": signature,
+            "ACCESS-TIMESTAMP": timestamp,
+            "ACCESS-PASSPHRASE": self.passphrase,
+        }
 
-# === Signing ===
-def bitget_signature(timestamp, method, request_path, body):
-    message = f"{timestamp}{method.upper()}{request_path}{body}"
-    mac = hmac.new(API_SECRET.encode('utf-8'), message.encode('utf-8'), hashlib.sha256)
-    return base64.b64encode(mac.digest()).decode()
+        url = f"{BASE_URL}{request_path}"
+        
+        try:
+            if method == "GET":
+                response = requests.get(url, headers=headers, params=params)
+            elif method == "POST":
+                response = requests.post(url, headers=headers, data=body_str)
+            else:
+                raise ValueError("Unsupported HTTP method")
 
-def make_headers(method, endpoint, body=""):
-    timestamp = str(int(time.time() * 1000))
-    sign = bitget_signature(timestamp, method, endpoint, body)
-    return {
-        "ACCESS-KEY": API_KEY,
-        "ACCESS-SIGN": sign,
-        "ACCESS-TIMESTAMP": timestamp,
-        "ACCESS-PASSPHRASE": PASSPHRASE,
-        "Content-Type": "application/json"
+            response.raise_for_status()
+            return response.json()
+        except requests.exceptions.HTTPError as err:
+            print(f"HTTP Error: {err}")
+            print(f"Response Content: {response.text}")
+            return {"code": "ERROR", "msg": f"HTTP Error: {response.status_code} - {response.text}"}
+        except Exception as e:
+            print(f"An unexpected error occurred: {e}")
+            return {"code": "ERROR", "msg": str(e)}
+
+    # --- Trading Functions ---
+
+    def get_position(self, symbol, product_type="USDT-FUTURES"):
+        """Fetches the current position(s) for a given symbol."""
+        path = "/api/v2/mix/position/single-position"
+        params = {
+            "symbol": symbol,
+            "productType": product_type
+        }
+        return self._send_request("GET", path, params=params)
+
+    def close_opposite_position(self, symbol, hold_side, product_type="USDT-FUTURES"):
+        """Closes an existing position at market price based on the holdSide (long/short)."""
+        print(f"Attempting to close existing {hold_side} position for {symbol}...")
+        path = "/api/v2/mix/order/close-positions"
+        body = {
+            "symbol": symbol,
+            "productType": product_type,
+            "holdSide": hold_side, # This is CRITICAL for closing one side in Hedge Mode
+        }
+        return self._send_request("POST", path, body=body)
+
+    def open_new_position(self, symbol, side, size, produ
+
+MAX || [C.O.], [04-11-2025 08:31 AM]
+ct_type="USDT-FUTURES", margin_coin="USDT"):
+        """Opens a new market position (buy/sell)."""
+        print(f"Attempting to open new {side} position for {symbol} with size {size}...")
+        
+        # CRITICAL: For placing an order, the side is 'buy' or 'sell'
+        # The position is automatically opened as 'long' for 'buy' and 'short' for 'sell'
+        # in Hedge Mode.
+        body = {
+            "symbol": symbol,
+            "productType": product_type,
+            "marginCoin": margin_coin,
+            "side": side, 
+            "orderType": "market",
+            "size": size,
+            "timeInForce": "GTC", # Good Till Cancelled
+            "posSide": side, # 'long' for 'buy', 'short' for 'sell' 
+            "leverage": LEVERAGE, # Use pre-defined leverage
+            "tradeType": "open",
+        }
+        path = "/api/v2/mix/trade/place-order"
+        return self._send_request("POST", path, body=body)
+
+# Initialize API client
+bg_api = BitgetAPI(API_KEY, API_SECRET, API_PASSPHRASE)
+
+
+# --- Webhook Endpoint ---
+@app.route("/webhook", methods=["POST"])
+def webhook_handler():
+    """
+    Handles incoming TradingView webhook alerts.
+    The expected payload is a JSON object like this:
+    {
+        "secret": "Your_Secret_Webhook_Key",
+        "symbol": "BTCUSDT",
+        "action": "buy",  // or "sell"
+        "size": "0.005"   // Optional: override the default TRADE_SIZE
     }
-
-# === Get current position ===
-def get_current_position(symbol):
-    """Get current position for the symbol"""
-    try:
-        endpoint = f"/api/mix/v1/position/singlePosition?symbol={symbol}&marginCoin=USDT"
-        url = BASE_URL + endpoint
-        request_path = f"/api/mix/v1/position/singlePosition?symbol={symbol}&marginCoin=USDT"
-        headers = make_headers("GET", request_path, "")
-        r = requests.get(url, headers=headers, timeout=10)
-        j = r.json()
-        
-        if j.get("code") in (0, "0"):
-            data = j.get("data") or {}
-            hold_side = data.get("holdSide", "").lower()
-            total = float(data.get("total", 0) or 0)
-            
-            if total > 0:
-                print(f"📊 Current position: {hold_side.upper()} - {total}")
-                return hold_side, total
-            else:
-                print("📊 No current position")
-                return None, 0
-        else:
-            print("⚠️ Position fetch returned:", r.status_code, r.text)
-    except Exception as e:
-        print("⚠️ Exception in get_current_position:", e)
+    """
     
-    return None, 0
-
-# === SIMPLE REVERSE TRADE APPROACH ===
-def place_reverse_trade(symbol, side):
-    """Simple reverse trade approach - just place the opposite trade"""
     try:
-        print(f"🎯 REVERSE TRADE for {symbol} - {side.upper()}")
-        print("=" * 50)
+        data = request.json
         
-        # STEP 1: Check current position
-        current_side, current_size = get_current_position(symbol)
+        # 1. Security Check
+        if data.get("secret") != TV_SECRET:
+            print("ERROR: Invalid webhook secret.")
+            return jsonify({"status": "error", "message": "Invalid secret"}), 401
+
+        symbol = data.get("symbol").upper().replace('/', '') # e.g., BTCUSDT
+        action = data.get("action").lower() # 'buy' or 'sell'
+        trade_size = data.get("size", TRADE_SIZE) # Use payload size or default
+
+        if action not in ["buy", "sell"]:
+            print(f"Invalid action received: {action}")
+            return jsonify({"status": "error", "message": "Invalid action"}), 400
+
+        print(f"--- Received {action.upper()} signal for {symbol} ---")
+
+        # Determine the position sides for current action
+        if action == "buy":
+            current_hold_side = "long"
+            opposite_hold_side = "short"
+            new_order_side = "buy"
+        else: # action == "sell"
+            current_hold_side = "short"
+            opposite_hold_side = "long"
+            new_order_side = "sell"
+            
+        # 2. Check for opposite position (CRITICAL STEP)
+        position_data = bg_api.get_position(symbol)
         
-        # STEP 2: Determine what trade to place
-        trade_size = round(TRADE_BALANCE * 3, 6)
-        if trade_size <= 0:
-            print("❌ Trade size is zero — set TRADE_BALANCE_USDT env var to >0")
-            return
+        if position_data.get("code") != "00000":
+            print(f"Error fetching position: {position_data.get('msg')}")
+            # Continue, as we might still open the new position if no current position is the reason for the error
         
-        # Determine order side based on desired position
-        if side.lower() == "buy":
-            order_side = "open_long"
-            target_side = "long"
+        # Bitget returns a list of positions (up to 2 in hedge mode)
+        positions = position_data.get("data", {}).get("list", [])
+
+        opposite_position_exists = False
+        for pos in positions:
+            # Check if there is an existing position in the opposite direction
+            if pos.get("holdSide") == opposite_hold_side and float(pos.get("total", 0)) > 0:
+                opposite_position_exists = True
+                break
+        
+        # 3. Close Opposite Position (Step 1)
+        if opposite_position_exists:
+            print(f"Found existing {opposite_hold_side} position. Closing it now...")
+            close_response = bg_api.close_opposite_position(symbol, opposite_hold_side)
+            
+            if close_response.get("code") == "00000":
+                print(f"Successfully sent market close order for {opposite_hold_side}.")
+                # In a real-world bot, you might want to wait a few seconds here 
+                # and confirm the close before opening the new position, but for a 
+                # simple script, proceeding is often sufficient if the close-position API is fast.
+                time.sleep(1) # Small delay to allow the close to process
+
+MAX || [C.O.], [04-11-2025 08:31 AM]
+else:
+                print(f"ERROR closing {opposite_hold_side} position: {close_response.get('msg')}")
+                # You may want to STOP here if the close fails to prevent opening a hedge position
+                # For this example, we log and proceed to open the new trade
         else:
-            order_side = "open_short" 
-            target_side = "short"
-        
-        print(f"💡 Target: {target_side.upper()}")
-        print(f"💡 Current: {current_side.upper() if current_side else 'NONE'}")
-        print(f"💰 Trade size: {trade_size} USDT")
-        
-        # STEP 3: Place the trade (Bitget hedge mode will handle the reversal)
-        endpoint = "/api/mix/v1/order/placeOrder"
-        payload = {
-            "symbol": symbol,
-            "marginCoin": "USDT",
-            "size": str(trade_size),
-            "side": order_side,
-            "orderType": "market",
-            "timeInForceValue": "normal"
-        }
-        
-        body = json.dumps(payload)
-        headers = make_headers("POST", endpoint, body)
-        url = BASE_URL + endpoint
-        print("🧾 Placing order:", payload)
-        
-        r = requests.post(url, headers=headers, data=body, timeout=15)
-        response_data = r.json()
-        print("🌍 Bitget Response:", r.status_code, r.text)
-        
-        if response_data.get("code") in (0, "0"):
-            print("✅✅✅ ORDER EXECUTED SUCCESSFULLY!")
-            
-            # Explain what happened
-            if current_side:
-                if (side.lower() == "buy" and current_side == "short") or (side.lower() == "sell" and current_side == "long"):
-                    print("🔄 POSITION REVERSED: Old position closed, new position opened")
-                else:
-                    print("📈 POSITION INCREASED: Same direction, position size increased")
-            else:
-                print("🆕 NEW POSITION: No previous position, new position opened")
-                
-            # Final check
-            print("\n🔍 Final position check...")
-            time.sleep(3)
-            final_side, final_size = get_current_position(symbol)
-            print(f"   ✅ Final: {final_side.upper() if final_side else 'NO POSITION'} - {final_size}")
-            
+            print(f"No existing {opposite_hold_side} position found. Proceeding to open new trade.")
+
+
+        # 4. Open New Position (Step 2)
+        open_response = bg_api.open_new_position(symbol, new_order_side, trade_size)
+
+        if open_response.get("code") == "00000":
+            print(f"Successfully placed new {new_order_side} order.")
+            return jsonify({
+                "status": "success",
+                "message": f"Closed opposite position (if any) and opened new {new_order_side} trade.",
+                "order_id": open_response.get("data", {}).get("orderId"),
+                "symbol": symbol
+            })
         else:
-            print("❌ Order failed:", response_data.get('msg', 'Unknown error'))
-            
-        print("=" * 50)
-            
+            print(f"ERROR opening new {new_order_side} position: {open_response.get('msg')}")
+            return jsonify({
+                "status": "error",
+                "message": f"Failed to open new {new_order_side} trade.",
+                "bitget_response": open_response.get("msg")
+            }), 500
+
     except Exception as e:
-        print("❌ Exception placing order:", e)
-
-# === ALTERNATIVE: Close then open approach with reduceOnly ===
-def close_then_open_trade(symbol, side):
-    """Alternative: Close any existing position first, then open new one"""
-    try:
-        print(f"🎯 CLOSE THEN OPEN for {symbol} - {side.upper()}")
-        print("=" * 50)
-        
-        # STEP 1: Check and close existing position
-        current_side, current_size = get_current_position(symbol)
-        
-        if current_side and current_size > 0:
-            print(f"🔻 Closing existing {current_side} position...")
-            
-            # Close existing position
-            close_side = "close_short" if current_side == "short" else "close_long"
-            endpoint = "/api/mix/v1/order/placeOrder"
-            payload = {
-                "symbol": symbol,
-                "marginCoin": "USDT",
-                "size": str(current_size),
-                "side": close_side,
-                "orderType": "market",
-                "timeInForceValue": "normal"
-            }
-            
-            body = json.dumps(payload)
-            headers = make_headers("POST", endpoint, body)
-            url = BASE_URL + endpoint
-            r = requests.post(url, headers=headers, data=body, timeout=15)
-            response_data = r.json()
-            
-            print("💥 Close order:", payload)
-            print("🌍 Close response:", r.status_code, r.text)
-            
-            if response_data.get("code") in (0, "0"):
-                print("✅ Position closed successfully")
-                # Wait for close to process
-                time.sleep(3)
-            else:
-                print("❌ Failed to close position")
-                return
-        
-        # STEP 2: Place new position
-        trade_size = round(TRADE_BALANCE * 3, 6)
-        if trade_size <= 0:
-            print("❌ Trade size is zero")
-            return
-        
-        if side.lower() == "buy":
-            order_side = "open_long"
-        else:
-            order_side = "open_short"
-            
-        endpoint = "/api/mix/v1/order/placeOrder"
-        payload = {
-            "symbol": symbol,
-            "marginCoin": "USDT",
-            "size": str(trade_size),
-            "side": order_side,
-            "orderType": "market",
-            "timeInForceValue": "normal"
-        }
-        
-        body = json.dumps(payload)
-        headers = make_headers("POST", endpoint, body)
-        url = BASE_URL + endpoint
-        print("🧾 Placing new order:", payload)
-        
-        r = requests.post(url, headers=headers, data=body, timeout=15)
-        response_data = r.json()
-        print("🌍 Open response:", r.status_code, r.text)
-        
-        if response_data.get("code") in (0, "0"):
-            print("✅✅✅ NEW POSITION OPENED SUCCESSFULLY!")
-            
-        print("=" * 50)
-            
-    except Exception as e:
-        print("❌ Exception in close_then_open_trade:", e)
-
-# === Webhook - Choose which method to use ===
-@app.route('/webhook', methods=['POST'])
-def webhook():
-    try:
-        print("🚀 Webhook triggered!")
-        data = request.get_json(force=True)
-        print("📩 Received payload:", data)
-        symbol = data.get("symbol")
-        side = data.get("side")
-        strategy = data.get("strategy", "reverse")  # "reverse" or "closefirst"
-        
-        if not symbol or not side:
-            return jsonify({"error": "missing symbol or side"}), 400
-        
-        if side.lower() not in ['buy', 'sell']:
-            return jsonify({"error": "side must be 'buy' or 'sell'"}), 400
-        
-        # Choose strategy based on parameter
-        if strategy == "closefirst":
-            close_then_open_trade(symbol, side)
-        else:
-            place_reverse_trade(symbol, side)
-            
-        return jsonify({"status": "ok"}), 200
-    except Exception as e:
-        print("❌ Webhook Error:", e)
-        return jsonify({"error": str(e)}), 500
-
-@app.route('/')
-def home():
-    return "✅ Bitget webhook running - REVERSE TRADE APPROACH"
-
-@app.route('/position/<symbol>', methods=['GET'])
-def check_position(symbol):
-    """Endpoint to check current position"""
-    side, size = get_current_position(symbol)
-    return jsonify({
-        "symbol": symbol,
-        "position_side": side,
-        "position_size": size
-    })
-
-@app.route('/test/<symbol>/<side>', methods=['GET'])
-def test_trade(symbol, side):
-    """Test endpoint for manual trading"""
-    if side.lower() not in ['buy', 'sell']:
-        return jsonify({"error": "side must be 'buy' or 'sell'"}), 400
-    place_reverse_trade(symbol, side)
-    return jsonify({"status": "test_executed"})
+        print(f"Unhandled exception: {e}")
+        return jsonify({"status": "error", "message": f"Internal Server Error: {e}"}), 500
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 10000)))
+    # Log the fact that the server is starting
+    print("Starting Bitget Webhook Listener...")
+    print(f"Listening for TradingView signals on /webhook")
+    # Run the Flask app
+    app.run(host="0.0.0.0", port=80)
