@@ -2,111 +2,240 @@ import os
 import time
 import hmac
 import hashlib
-import base64
+import urllib.parse
 import json
 import requests
 from flask import Flask, request, jsonify
 
 app = Flask(__name__)
 
-# --- Configuration ---
-API_KEY = os.getenv("API_KEY") or os.getenv("BITGET_API_KEY")
-API_SECRET = os.getenv("API_SECRET") or os.getenv("BITGET_API_SECRET")
-PASSPHRASE = os.getenv("PASSPHRASE") or os.getenv("BITGET_API_PASSPHRASE")
-TRADE_BALANCE = float(os.getenv("TRADE_BALANCE_USDT", os.getenv("TRADE_BALANCE", "0.0")))
+# --- BingX Configuration ---
+API_KEY = os.getenv("BINGX_API_KEY")
+SECRET_KEY = os.getenv("BINGX_SECRET_KEY")
+TRADE_BALANCE = float(os.getenv("TRADE_BALANCE_USDT", "25"))
 
-BASE_URL = "https://api.bitget.com"
+BASE_URL = "https://open-api.bingx.com"
 
-def bitget_signature(timestamp, method, request_path, body):
-    message = f"{timestamp}{method.upper()}{request_path}{body}"
-    mac = hmac.new(API_SECRET.encode('utf-8'), message.encode('utf-8'), hashlib.sha256)
-    return base64.b64encode(mac.digest()).decode()
+# === BingX Signature ===
+def bingx_signature(params, secret_key):
+    query_string = '&'.join([f"{key}={value}" for key, value in params.items()])
+    signature = hmac.new(secret_key.encode('utf-8'), query_string.encode('utf-8'), hashlib.sha256).hexdigest()
+    return signature
 
-def make_headers(method, endpoint, body=""):
-    timestamp = str(int(time.time() * 1000))
-    sign = bitget_signature(timestamp, method, endpoint, body)
+def bingx_headers():
     return {
-        "ACCESS-KEY": API_KEY,
-        "ACCESS-SIGN": sign,
-        "ACCESS-TIMESTAMP": timestamp,
-        "ACCESS-PASSPHRASE": PASSPHRASE,
+        "X-BX-APIKEY": API_KEY,
         "Content-Type": "application/json"
     }
 
-# === ULTRA SIMPLE: Just place the trade ===
-def place_trade(symbol, side):
-    """ULTRA SIMPLE: Just place the trade and let Bitget handle position management"""
+# === Get Current Position ===
+def get_current_position(symbol):
+    """Get current position for symbol"""
     try:
-        trade_size = round(TRADE_BALANCE * 3, 6)
-        if trade_size <= 0:
-            print("❌ Invalid trade size")
-            return False
-        
-        if side.lower() == "buy":
-            order_side = "open_long"
-            side_name = "LONG"
-        else:
-            order_side = "open_short" 
-            side_name = "SHORT"
-        
-        endpoint = "/api/mix/v1/order/placeOrder"
-        payload = {
+        params = {
             "symbol": symbol,
-            "marginCoin": "USDT",
-            "size": str(trade_size),
-            "side": order_side,
-            "orderType": "market",
-            "timeInForceValue": "normal"
+            "timestamp": int(time.time() * 1000)
         }
         
-        body = json.dumps(payload)
-        headers = make_headers("POST", endpoint, body)
-        url = BASE_URL + endpoint
+        signature = bingx_signature(params, SECRET_KEY)
+        params["signature"] = signature
         
-        print(f"📈 Placing {side_name} order: {trade_size} USDT")
-        r = requests.post(url, headers=headers, data=body, timeout=15)
-        response = r.json()
+        url = f"{BASE_URL}/openApi/swap/v2/user/positions"
+        response = requests.get(url, headers=bingx_headers(), params=params, timeout=10)
+        data = response.json()
         
-        print(f"🌍 Response: {response}")
+        if "data" in data and data["data"]:
+            for position in data["data"]:
+                if position["symbol"] == symbol and float(position["positionAmt"] or 0) != 0:
+                    return {
+                        "side": "LONG" if float(position["positionAmt"] or 0) > 0 else "SHORT",
+                        "quantity": abs(float(position["positionAmt"] or 0)),
+                        "leverage": position.get("leverage", 1)
+                    }
+        return None
+    except Exception as e:
+        print(f"❌ Error getting position: {e}")
+        return None
+
+# === Close Position ===
+def close_position(symbol, side, quantity):
+    """Close existing position"""
+    try:
+        # For closing, use opposite side
+        if side == "LONG":
+            close_side = "SELL"
+        else:
+            close_side = "BUY"
         
-        if response.get("code") in (0, "0"):
-            print(f"✅ {side_name} ORDER PLACED SUCCESSFULLY!")
+        params = {
+            "symbol": symbol,
+            "side": close_side,
+            "positionSide": "BOTH",  # For one-way mode
+            "type": "MARKET",
+            "quantity": abs(quantity),
+            "timestamp": int(time.time() * 1000)
+        }
+        
+        signature = bingx_signature(params, SECRET_KEY)
+        params["signature"] = signature
+        
+        url = f"{BASE_URL}/openApi/swap/v2/trade/order"
+        response = requests.post(url, headers=bingx_headers(), json=params, timeout=15)
+        data = response.json()
+        
+        print(f"🔻 Closing {side} position: {quantity}")
+        print(f"🌍 Close response: {data}")
+        
+        if data.get("code") == 0:
+            print("✅ Position closed successfully")
             return True
         else:
-            print(f"❌ Order failed: {response.get('msg')}")
+            print(f"❌ Close failed: {data.get('msg')}")
             return False
             
     except Exception as e:
-        print(f"❌ Error: {e}")
+        print(f"❌ Error closing position: {e}")
         return False
 
+# === Open Position ===
+def open_position(symbol, side, quantity):
+    """Open new position"""
+    try:
+        params = {
+            "symbol": symbol,
+            "side": side,
+            "positionSide": "BOTH",  # For one-way mode
+            "type": "MARKET",
+            "quantity": quantity,
+            "timestamp": int(time.time() * 1000)
+        }
+        
+        signature = bingx_signature(params, SECRET_KEY)
+        params["signature"] = signature
+        
+        url = f"{BASE_URL}/openApi/swap/v2/trade/order"
+        response = requests.post(url, headers=bingx_headers(), json=params, timeout=15)
+        data = response.json()
+        
+        print(f"📈 Opening {side} position: {quantity}")
+        print(f"🌍 Open response: {data}")
+        
+        if data.get("code") == 0:
+            print(f"✅ {side} position opened successfully")
+            return True
+        else:
+            print(f"❌ Open failed: {data.get('msg')}")
+            return False
+            
+    except Exception as e:
+        print(f"❌ Error opening position: {e}")
+        return False
+
+# === Execute Trade Logic ===
+def execute_trade(symbol, action):
+    """Main trade execution logic"""
+    print(f"🎯 Executing {action} for {symbol}")
+    print("=" * 50)
+    
+    # Calculate trade size (3x leverage)
+    trade_size = round(TRADE_BALANCE * 3, 3)  # BingX uses 3 decimal places
+    
+    if trade_size <= 0:
+        print("❌ Invalid trade size")
+        return
+    
+    # Get current position
+    current_position = get_current_position(symbol)
+    
+    if action.upper() == "BUY":
+        # For BUY: Close any existing SHORT position, then open LONG
+        if current_position and current_position["side"] == "SHORT":
+            print("🔄 Closing SHORT position before opening LONG")
+            close_position(symbol, "SHORT", current_position["quantity"])
+            time.sleep(1)  # Small delay to ensure close is processed
+        
+        print("📈 Opening LONG position")
+        open_position(symbol, "BUY", trade_size)
+        
+    elif action.upper() == "SELL":
+        # For SELL: Close any existing LONG position, then open SHORT
+        if current_position and current_position["side"] == "LONG":
+            print("🔄 Closing LONG position before opening SHORT")
+            close_position(symbol, "LONG", current_position["quantity"])
+            time.sleep(1)  # Small delay to ensure close is processed
+        
+        print("📉 Opening SHORT position")
+        open_position(symbol, "SELL", trade_size)
+    
+    print("=" * 50)
+
+# === Webhook Endpoint ===
 @app.route('/webhook', methods=['POST'])
 def webhook():
     try:
-        data = request.get_json()
+        print("🚀 TradingView Webhook Triggered!")
+        data = request.get_json(force=True)
+        print(f"📩 Received payload: {data}")
+        
         symbol = data.get("symbol")
         side = data.get("side")
         
         if not symbol or not side:
             return jsonify({"error": "missing symbol or side"}), 400
         
-        if side.lower() not in ['buy', 'sell']:
-            return jsonify({"error": "side must be 'buy' or 'sell'"}), 400
+        if side.upper() not in ['BUY', 'SELL']:
+            return jsonify({"error": "side must be 'BUY' or 'SELL'"}), 400
         
-        print(f"🚀 TradingView Alert: {side.upper()} {symbol}")
+        # Execute the trade
+        execute_trade(symbol, side.upper())
         
-        # JUST PLACE THE TRADE - let Bitget handle position management
-        place_trade(symbol, side)
-        
-        return jsonify({"status": "executed"}), 200
+        return jsonify({"status": "success", "message": "Trade executed"}), 200
         
     except Exception as e:
         print(f"❌ Webhook Error: {e}")
         return jsonify({"error": str(e)}), 500
 
+# === Utility Endpoints ===
 @app.route('/')
 def home():
-    return "✅ Bitget Bot - ULTRA SIMPLE WORKING VERSION"
+    return """
+    ✅ BingX Trading Bot - ACTIVE
+    
+    Usage:
+    - Send POST to /webhook with JSON:
+      {
+        "symbol": "SUI-USDT",
+        "side": "BUY"
+      }
+    
+    Endpoints:
+    - GET /position/SUI-USDT - Check current position
+    - POST /close/SUI-USDT - Close position manually
+    """
+
+@app.route('/position/<symbol>', methods=['GET'])
+def check_position(symbol):
+    """Check current position for a symbol"""
+    position = get_current_position(symbol)
+    return jsonify({
+        "symbol": symbol,
+        "position": position if position else "No position",
+        "trade_balance": TRADE_BALANCE,
+        "calculated_size": round(TRADE_BALANCE * 3, 3)
+    })
+
+@app.route('/close/<symbol>', methods=['POST'])
+def close_position_manual(symbol):
+    """Manually close position for a symbol"""
+    position = get_current_position(symbol)
+    if position:
+        success = close_position(symbol, position["side"], position["quantity"])
+        return jsonify({"status": "success" if success else "error"})
+    else:
+        return jsonify({"status": "no_position"})
 
 if __name__ == "__main__":
+    print("🔷 Starting BingX Trading Bot")
+    print(f"💰 Trade Balance: {TRADE_BALANCE} USDT")
+    print(f"📊 Calculated Position Size: {TRADE_BALANCE * 3} USDT")
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 10000)))
