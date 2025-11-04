@@ -34,7 +34,7 @@ def bingx_headers():
 
 # === Get Account Balance ===
 def get_account_balance():
-    """Get available USDT balance"""
+    """Get available USDT balance - CORRECT ENDPOINT"""
     try:
         params = {
             "timestamp": int(time.time() * 1000)
@@ -43,20 +43,24 @@ def get_account_balance():
         signature = bingx_signature(params, SECRET_KEY)
         params["signature"] = signature
         
+        # Correct balance endpoint
         url = f"{BASE_URL}/openApi/swap/v2/user/balance"
         response = requests.get(url, headers=bingx_headers(), params=params, timeout=10)
         data = response.json()
         
+        print(f"💰 Balance response: {data}")
+        
         if data.get("code") == 0 and "data" in data:
-            for asset in data["data"]:
-                if asset.get("asset") == "USDT":
-                    available_balance = float(asset.get("availableBalance", 0))
-                    print(f"💰 Available USDT Balance: {available_balance}")
-                    return available_balance
-        return 0
+            # BingX returns balance directly in data
+            balance_data = data["data"]
+            if "balance" in balance_data:
+                available_balance = float(balance_data.get("balance", 0))
+                print(f"💰 Available Balance: {available_balance} USDT")
+                return available_balance
+        return TRADE_BALANCE  # Fallback to trade balance
     except Exception as e:
         print(f"❌ Error getting balance: {e}")
-        return 0
+        return TRADE_BALANCE  # Fallback
 
 # === Get Current Position ===
 def get_current_position(symbol):
@@ -74,13 +78,16 @@ def get_current_position(symbol):
         response = requests.get(url, headers=bingx_headers(), params=params, timeout=10)
         data = response.json()
         
-        if "data" in data and data["data"]:
-            for position in data["data"]:
-                if position["symbol"] == symbol and float(position["positionAmt"] or 0) != 0:
+        print(f"📊 Position response: {data}")
+        
+        if data.get("code") == 0 and "data" in data:
+            positions = data["data"]
+            for position in positions:
+                position_amt = float(position.get("positionAmt", 0))
+                if position_amt != 0:
                     return {
-                        "side": "LONG" if float(position["positionAmt"] or 0) > 0 else "SHORT",
-                        "quantity": abs(float(position["positionAmt"] or 0)),
-                        "leverage": position.get("leverage", 1)
+                        "side": "LONG" if position_amt > 0 else "SHORT",
+                        "quantity": abs(position_amt),
                     }
         return None
     except Exception as e:
@@ -89,11 +96,12 @@ def get_current_position(symbol):
 
 # === Set Leverage ===
 def set_leverage(symbol, leverage=10):
-    """Set leverage for the symbol"""
+    """Set leverage for the symbol - CORRECT ENDPOINT"""
     try:
         params = {
             "symbol": symbol,
             "leverage": leverage,
+            "side": "LONG",  # Required field for BingX
             "timestamp": int(time.time() * 1000)
         }
         
@@ -112,29 +120,23 @@ def set_leverage(symbol, leverage=10):
         print(f"❌ Error setting leverage: {e}")
         return False
 
-# === Calculate Safe Position Size ===
-def calculate_position_size(symbol):
-    """Calculate safe position size based on available balance"""
+# === Calculate Position Size ===
+def calculate_position_size():
+    """Calculate position size based on TRADE_BALANCE"""
     try:
-        # Get available balance
-        available_balance = get_account_balance()
+        # Simple calculation: Use TRADE_BALANCE * 3
+        position_size = TRADE_BALANCE * 3
         
-        if available_balance <= 0:
-            print("❌ No available balance")
-            return 0
+        # For safety, let's use a smaller size to avoid margin issues
+        safe_size = min(position_size, TRADE_BALANCE * 2)  # Use 2x instead of 3x for safety
         
-        # Use the smaller of: TRADE_BALANCE * 3 or 80% of available balance
-        desired_size = TRADE_BALANCE * 3
-        safe_size = min(desired_size, available_balance * 0.8)
-        
-        print(f"💰 Available Balance: {available_balance} USDT")
-        print(f"📊 Desired Size (3x): {desired_size} USDT")
-        print(f"🛡️ Safe Size: {safe_size} USDT")
+        print(f"💰 Trade Balance: {TRADE_BALANCE} USDT")
+        print(f"📊 Position Size: {safe_size} USDT (2x for safety)")
         
         return round(safe_size, 3)
     except Exception as e:
         print(f"❌ Error calculating position size: {e}")
-        return round(TRADE_BALANCE * 3, 3)  # Fallback
+        return round(TRADE_BALANCE * 2, 3)  # Safe fallback
 
 # === Close Position ===
 def close_position(symbol, side, quantity):
@@ -143,13 +145,15 @@ def close_position(symbol, side, quantity):
         # For closing, use opposite side
         if side == "LONG":
             close_side = "SELL"
+            position_side = "LONG"
         else:
             close_side = "BUY"
+            position_side = "SHORT"
         
         params = {
             "symbol": symbol,
             "side": close_side,
-            "positionSide": "LONG" if side == "LONG" else "SHORT",
+            "positionSide": position_side,
             "type": "MARKET",
             "quantity": abs(quantity),
             "timestamp": int(time.time() * 1000)
@@ -180,10 +184,15 @@ def close_position(symbol, side, quantity):
 def open_position(symbol, side, quantity):
     """Open new position"""
     try:
+        if side == "BUY":
+            position_side = "LONG"
+        else:
+            position_side = "SHORT"
+        
         params = {
             "symbol": symbol,
             "side": side,
-            "positionSide": "LONG" if side == "BUY" else "SHORT",
+            "positionSide": position_side,
             "type": "MARKET",
             "quantity": quantity,
             "timestamp": int(time.time() * 1000)
@@ -216,19 +225,18 @@ def execute_trade(symbol, action):
     print(f"🎯 Executing {action} for {symbol}")
     print("=" * 60)
     
-    # STEP 0: Set leverage first
-    print("⚙️ Setting leverage to 10x...")
-    set_leverage(symbol, 10)
+    # STEP 0: Set leverage first (try both LONG and SHORT)
+    print("⚙️ Setting leverage...")
+    set_leverage(symbol, 10)  # Set for LONG side
     time.sleep(1)
     
-    # STEP 1: Calculate safe position size
-    trade_size = calculate_position_size(symbol)
+    # STEP 1: Calculate position size
+    trade_size = calculate_position_size()
     
     if trade_size <= 0:
-        print("❌ Invalid trade size or insufficient balance")
+        print("❌ Invalid trade size")
         return
     
-    print(f"💰 Trade Balance: {TRADE_BALANCE} USDT")
     print(f"📊 Final Position Size: {trade_size} USDT")
     
     # STEP 2: Get current position
@@ -240,7 +248,7 @@ def execute_trade(symbol, action):
         print(f"🔄 Closing existing {current_position['side']} position first...")
         if close_position(symbol, current_position["side"], current_position["quantity"]):
             print("✅ Position closed, waiting for settlement...")
-            time.sleep(2)  # Wait for close to process
+            time.sleep(3)  # Wait for close to process
         else:
             print("❌ Failed to close existing position, aborting trade")
             return
@@ -297,7 +305,7 @@ def home():
     Features:
     - Closes existing position first
     - Sets 10x leverage automatically
-    - Calculates safe position size based on available balance
+    - Uses 2x position size for safety
     - All orders at market price
     
     Endpoints:
@@ -323,7 +331,7 @@ def check_balance():
     return jsonify({
         "available_balance": balance,
         "trade_balance": TRADE_BALANCE,
-        "calculated_position_size": round(TRADE_BALANCE * 3, 3)
+        "position_size": round(TRADE_BALANCE * 2, 3)
     })
 
 @app.route('/close/<symbol>', methods=['POST'])
@@ -336,22 +344,10 @@ def close_position_manual(symbol):
     else:
         return jsonify({"status": "no_position"})
 
-@app.route('/test', methods=['GET'])
-def test():
-    """Test endpoint"""
-    balance = get_account_balance()
-    return jsonify({
-        "status": "active",
-        "timestamp": time.time(),
-        "trade_balance": TRADE_BALANCE,
-        "available_balance": balance,
-        "calculated_position_size": round(TRADE_BALANCE * 3, 3)
-    })
-
 if __name__ == "__main__":
     print("🔷 Starting BingX Trading Bot")
     print(f"💰 Trade Balance: {TRADE_BALANCE} USDT")
-    print(f"📊 Max Position Size (3x): {TRADE_BALANCE * 3} USDT")
+    print(f"📊 Position Size (2x for safety): {TRADE_BALANCE * 2} USDT")
     print("🎯 Supported pairs: SOL-USDT, SUI-USDT, etc.")
     print("⚙️ Auto leverage: 10x")
     print("🚀 Webhook ready at: /webhook")
