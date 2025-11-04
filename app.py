@@ -1,4 +1,3 @@
-MAX || [C.O.], [04-11-2025 08:31 AM]
 import hmac
 import hashlib
 import time
