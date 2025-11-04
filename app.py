@@ -32,9 +32,9 @@ def bingx_headers():
         "Content-Type": "application/json"
     }
 
-# === Get Account Balance ===
+# === Get Account Balance - FIXED ===
 def get_account_balance():
-    """Get available USDT balance"""
+    """Get available USDT balance - FIXED VERSION"""
     try:
         params = {
             "timestamp": int(time.time() * 1000)
@@ -47,14 +47,34 @@ def get_account_balance():
         response = requests.get(url, headers=bingx_headers(), params=params, timeout=10)
         data = response.json()
         
+        print(f"💰 Balance response: {data}")
+        
         if data.get("code") == 0 and "data" in data:
             balance_data = data["data"]
-            available_balance = float(balance_data.get("availableBalance", 
-                                    balance_data.get("balance", 
-                                    balance_data.get("totalBalance", 0))))
+            
+            # Handle different response formats
+            if isinstance(balance_data, dict):
+                # If it's a dictionary, extract the balance
+                available_balance = float(balance_data.get("availableBalance", 
+                                        balance_data.get("balance", 
+                                        balance_data.get("totalBalance", TRADE_BALANCE))))
+            elif isinstance(balance_data, list) and len(balance_data) > 0:
+                # If it's a list, find USDT balance
+                for asset in balance_data:
+                    if asset.get("asset") == "USDT":
+                        available_balance = float(asset.get("availableBalance", TRADE_BALANCE))
+                        break
+                else:
+                    available_balance = TRADE_BALANCE
+            else:
+                available_balance = TRADE_BALANCE
+            
             print(f"💰 Available Balance: {available_balance} USDT")
             return available_balance
+        
+        # If API call fails, return TRADE_BALANCE as fallback
         return TRADE_BALANCE
+        
     except Exception as e:
         print(f"❌ Error getting balance: {e}")
         return TRADE_BALANCE
@@ -126,24 +146,13 @@ def set_leverage(symbol, leverage=10):
         print(f"❌ Error setting leverage: {e}")
         return False
 
-# === Calculate Position Size ===
+# === Calculate Position Size - SIMPLIFIED ===
 def calculate_position_size():
-    """Calculate position size - EXACTLY 3x of TRADE_BALANCE"""
-    try:
-        # Get actual available balance
-        available_balance = get_account_balance()
-        
-        # Use EXACTLY 3x of TRADE_BALANCE
-        position_size = TRADE_BALANCE * 3
-        
-        print(f"💰 Available Balance: {available_balance} USDT")
-        print(f"💰 Trade Balance: {TRADE_BALANCE} USDT")
-        print(f"📊 Position Size (3x): {position_size} USDT")
-        
-        return round(position_size, 3)
-    except Exception as e:
-        print(f"❌ Error calculating position size: {e}")
-        return round(TRADE_BALANCE * 3, 3)
+    """Calculate position size - EXACTLY 3x of TRADE_BALANCE (No balance check)"""
+    position_size = TRADE_BALANCE * 3
+    print(f"💰 Trade Balance: {TRADE_BALANCE} USDT")
+    print(f"📊 Position Size (3x): {position_size} USDT")
+    return round(position_size, 3)
 
 # === Close Position ===
 def close_position(symbol, side, quantity):
@@ -313,8 +322,6 @@ def home():
       {"symbol": "SOL-USDT", "side": "BUY"}
       {"symbol": "SUI-USDT", "side": "SELL"} 
       {"symbol": "BTC-USDT", "side": "BUY"}
-      {"symbol": "ETH-USDT", "side": "SELL"}
-      {"symbol": "ADA-USDT", "side": "BUY"}
       (Works with ANY BingX futures pair)
     
     Features:
@@ -322,7 +329,6 @@ def home():
     - 10x leverage for sufficient margin
     - Closes existing positions first
     - Works with ANY trading pair
-    - All orders at market price
     """
 
 @app.route('/position/<symbol>', methods=['GET'])
@@ -360,7 +366,5 @@ if __name__ == "__main__":
     print("🔷 Starting BingX Trading Bot")
     print(f"💰 Trade Balance: {TRADE_BALANCE} USDT")
     print(f"📊 Position Size (3x): {TRADE_BALANCE * 3} USDT")
-    print("🎯 Supports ALL trading pairs: SOL-USDT, SUI-USDT, BTC-USDT, ETH-USDT, ADA-USDT, etc.")
-    print("⚙️ 10x leverage for sufficient margin")
-    print("🚀 Webhook ready for ANY TradingView alert")
+    print("🎯 Supports ALL trading pairs")
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 10000)))
