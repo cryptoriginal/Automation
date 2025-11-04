@@ -258,20 +258,12 @@ def home():
     - Send POST to /webhook with JSON:
       {"symbol": "SOL-USDT", "side": "BUY"}
       {"symbol": "SUI-USDT", "side": "SELL"}
-      {"symbol": "BTC-USDT", "side": "BUY"}
-      {"symbol": "ETH-USDT", "side": "SELL"}
-      (Works with ANY BingX futures pair)
     
     Features:
     - 3x leverage exactly
     - Position size: TRADE_BALANCE * 3
     - Closes existing positions first
     - Works with any trading pair
-    - All orders at market price
-    
-    Endpoints:
-    - GET /position/SOL-USDT - Check current position
-    - POST /close/SOL-USDT - Close position manually
     """
 
 @app.route('/position/<symbol>', methods=['GET'])
@@ -299,7 +291,7 @@ if __name__ == "__main__":
     print("🔷 Starting BingX Trading Bot")
     print(f"💰 Trade Balance: {TRADE_BALANCE} USDT")
     print(f"📊 Position Size (3x): {TRADE_BALANCE * 3} USDT")
-    print("🎯 Supports ANY trading pair: SOL-USDT, SUI-USDT, BTC-USDT, ETH-USDT, etc.")
+    print("🎯 Supports ANY trading pair")
     print("⚙️ Fixed 3x leverage")
-    print("🚀 Webhook ready for any TradingView alert")
+    print("🚀 Webhook ready for TradingView alerts")
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 10000)))
