@@ -1,4 +1,3 @@
-MAX || [C.O.], [03-11-2025 10:04 PM]
 import os
 import time
 import hmac
