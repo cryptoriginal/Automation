@@ -47,8 +47,6 @@ def get_account_balance():
         response = requests.get(url, headers=bingx_headers(), params=params, timeout=10)
         data = response.json()
         
-        print(f"💰 Balance response: {data}")
-        
         if data.get("code") == 0 and "data" in data:
             balance_data = data["data"]
             available_balance = float(balance_data.get("availableBalance", 
@@ -108,7 +106,6 @@ def set_leverage(symbol, leverage=10):
         
         url = f"{BASE_URL}/openApi/swap/v2/trade/leverage"
         response_long = requests.post(url, headers=bingx_headers(), json=params_long, timeout=15)
-        print(f"⚙️ LONG Leverage response: {response_long.json()}")
         
         # Set for SHORT side
         params_short = {
@@ -122,7 +119,6 @@ def set_leverage(symbol, leverage=10):
         params_short["signature"] = signature_short
         
         response_short = requests.post(url, headers=bingx_headers(), json=params_short, timeout=15)
-        print(f"⚙️ SHORT Leverage response: {response_short.json()}")
         
         print(f"⚙️ Setting leverage to {leverage}x for {symbol}")
         return True
@@ -132,23 +128,22 @@ def set_leverage(symbol, leverage=10):
 
 # === Calculate Position Size ===
 def calculate_position_size():
-    """Calculate position size that will work"""
+    """Calculate position size - EXACTLY 3x of TRADE_BALANCE"""
     try:
         # Get actual available balance
         available_balance = get_account_balance()
         
-        # Start with smaller position to ensure it works
-        # Use 1x TRADE_BALANCE first, then we can increase
-        safe_size = TRADE_BALANCE  # 50 USDT
+        # Use EXACTLY 3x of TRADE_BALANCE
+        position_size = TRADE_BALANCE * 3
         
         print(f"💰 Available Balance: {available_balance} USDT")
         print(f"💰 Trade Balance: {TRADE_BALANCE} USDT")
-        print(f"📊 Position Size: {safe_size} USDT")
+        print(f"📊 Position Size (3x): {position_size} USDT")
         
-        return round(safe_size, 3)
+        return round(position_size, 3)
     except Exception as e:
         print(f"❌ Error calculating position size: {e}")
-        return round(TRADE_BALANCE, 3)
+        return round(TRADE_BALANCE * 3, 3)
 
 # === Close Position ===
 def close_position(symbol, side, quantity):
@@ -232,16 +227,16 @@ def open_position(symbol, side, quantity):
 
 # === Execute Trade Logic ===
 def execute_trade(symbol, action):
-    """Main trade execution logic"""
+    """Main trade execution logic - WORKS WITH ANY PAIR"""
     print(f"🎯 Executing {action} for {symbol}")
     print("=" * 60)
     
-    # STEP 0: Set higher leverage (10x) to ensure margin is sufficient
+    # STEP 0: Set leverage to 10x for sufficient margin
     print("⚙️ Setting leverage to 10x...")
     set_leverage(symbol, 10)
     time.sleep(2)
     
-    # STEP 1: Calculate position size - start with 1x to ensure it works
+    # STEP 1: Calculate position size - EXACTLY 3x of TRADE_BALANCE
     trade_size = calculate_position_size()
     
     if trade_size <= 5:
@@ -277,7 +272,7 @@ def execute_trade(symbol, action):
     if success:
         print("✅✅✅ TRADE EXECUTED SUCCESSFULLY!")
     else:
-        print("❌ Trade failed - try smaller position size")
+        print("❌ Trade failed")
     
     print("=" * 60)
 
@@ -298,13 +293,16 @@ def webhook():
         if side.upper() not in ['BUY', 'SELL']:
             return jsonify({"error": "side must be 'BUY' or 'SELL'"}), 400
         
+        # Execute the trade for ANY pair
         execute_trade(symbol, side.upper())
+        
         return jsonify({"status": "success", "message": "Trade executed"}), 200
         
     except Exception as e:
         print(f"❌ Webhook Error: {e}")
         return jsonify({"error": str(e)}), 500
 
+# === Utility Endpoints ===
 @app.route('/')
 def home():
     return """
@@ -313,33 +311,44 @@ def home():
     Usage:
     - Send POST to /webhook with JSON:
       {"symbol": "SOL-USDT", "side": "BUY"}
-      {"symbol": "SUI-USDT", "side": "SELL"}
+      {"symbol": "SUI-USDT", "side": "SELL"} 
+      {"symbol": "BTC-USDT", "side": "BUY"}
+      {"symbol": "ETH-USDT", "side": "SELL"}
+      {"symbol": "ADA-USDT", "side": "BUY"}
+      (Works with ANY BingX futures pair)
     
     Features:
+    - 3x position size of TRADE_BALANCE
     - 10x leverage for sufficient margin
-    - Safe position sizing (50 USDT)
     - Closes existing positions first
+    - Works with ANY trading pair
+    - All orders at market price
     """
 
 @app.route('/position/<symbol>', methods=['GET'])
 def check_position(symbol):
+    """Check current position for ANY symbol"""
     position = get_current_position(symbol)
     return jsonify({
         "symbol": symbol,
-        "position": position if position else "No position"
+        "position": position if position else "No position",
+        "trade_balance": TRADE_BALANCE,
+        "position_size": TRADE_BALANCE * 3
     })
 
 @app.route('/balance', methods=['GET'])
 def check_balance():
+    """Check available balance"""
     balance = get_account_balance()
     return jsonify({
         "available_balance": balance,
         "trade_balance": TRADE_BALANCE,
-        "position_size": TRADE_BALANCE
+        "position_size": TRADE_BALANCE * 3
     })
 
 @app.route('/close/<symbol>', methods=['POST'])
 def close_position_manual(symbol):
+    """Manually close position for ANY symbol"""
     position = get_current_position(symbol)
     if position:
         success = close_position(symbol, position["side"], position["quantity"])
@@ -350,6 +359,8 @@ def close_position_manual(symbol):
 if __name__ == "__main__":
     print("🔷 Starting BingX Trading Bot")
     print(f"💰 Trade Balance: {TRADE_BALANCE} USDT")
-    print(f"📊 Position Size: {TRADE_BALANCE} USDT")
+    print(f"📊 Position Size (3x): {TRADE_BALANCE * 3} USDT")
+    print("🎯 Supports ALL trading pairs: SOL-USDT, SUI-USDT, BTC-USDT, ETH-USDT, ADA-USDT, etc.")
     print("⚙️ 10x leverage for sufficient margin")
+    print("🚀 Webhook ready for ANY TradingView alert")
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 10000)))
