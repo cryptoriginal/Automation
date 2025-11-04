@@ -9,7 +9,7 @@ from flask import Flask, request, jsonify
 
 app = Flask(__name__)
 
-# --- Read env vars with fallback to BITGET_* names if present ---
+# --- Configuration ---
 API_KEY = os.getenv("API_KEY") or os.getenv("BITGET_API_KEY")
 API_SECRET = os.getenv("API_SECRET") or os.getenv("BITGET_API_SECRET")
 PASSPHRASE = os.getenv("PASSPHRASE") or os.getenv("BITGET_API_PASSPHRASE")
@@ -34,110 +34,111 @@ def make_headers(method, endpoint, body=""):
         "Content-Type": "application/json"
     }
 
-# === Get current position ===
-def get_current_position(symbol):
-    """Get current position for the symbol"""
+# === Get ALL positions (both long and short) ===
+def get_all_positions(symbol):
+    """Get all positions for the symbol"""
     try:
-        endpoint = f"/api/mix/v1/position/singlePosition?symbol={symbol}&marginCoin=USDT"
+        endpoint = f"/api/mix/v1/position/allPosition?symbol={symbol}&marginCoin=USDT"
         url = BASE_URL + endpoint
-        request_path = f"/api/mix/v1/position/singlePosition?symbol={symbol}&marginCoin=USDT"
+        request_path = f"/api/mix/v1/position/allPosition?symbol={symbol}&marginCoin=USDT"
         headers = make_headers("GET", request_path, "")
         r = requests.get(url, headers=headers, timeout=10)
         j = r.json()
         
         if j.get("code") in (0, "0"):
-            data = j.get("data") or {}
-            hold_side = data.get("holdSide", "").lower()
-            total = float(data.get("total", 0) or 0)
-            available = float(data.get("available", 0) or 0)
+            positions = j.get("data", [])
+            active_positions = []
             
-            return hold_side, total, available
+            for pos in positions:
+                total = float(pos.get("total", 0) or 0)
+                if total > 0:
+                    position_info = {
+                        "holdSide": pos.get("holdSide", "").lower(),
+                        "total": total,
+                        "available": float(pos.get("available", 0) or 0),
+                        "symbol": pos.get("symbol"),
+                        "positionId": pos.get("positionId")
+                    }
+                    active_positions.append(position_info)
+                    print(f"📊 Found: {position_info['holdSide']} - {position_info['total']}")
+            
+            return active_positions
         else:
             print("❌ Position fetch error:", j.get('msg'))
     except Exception as e:
-        print("❌ Exception in get_current_position:", e)
+        print("❌ Exception in get_all_positions:", e)
     
-    return None, 0, 0
+    return []
 
-# === Close position at market price ===
-def close_position_market(symbol, side=None):
-    """Close position at market price"""
+# === CLOSE ALL POSITIONS ===
+def close_all_positions(symbol):
+    """Close ALL positions for the symbol"""
     try:
-        # If no side specified, get current position
-        if not side:
-            current_side, current_size, available = get_current_position(symbol)
-            if not current_side or current_size == 0:
-                print("✅ No position to close")
-                return True
-            side = current_side
+        positions = get_all_positions(symbol)
         
-        # Determine close side
-        if side.lower() == "long":
-            close_side = "close_long"
-            side_name = "LONG"
-        else:
-            close_side = "close_short" 
-            side_name = "SHORT"
+        if not positions:
+            print("✅ No positions to close")
+            return True
         
-        # Get position size
-        current_side, current_size, available = get_current_position(symbol)
-        close_size = available if available > 0 else current_size
+        print(f"🔄 Closing {len(positions)} positions...")
         
-        if close_size <= 0:
-            print("❌ No position size to close")
-            return False
-        
-        # Place close order at market
-        endpoint = "/api/mix/v1/order/placeOrder"
-        payload = {
-            "symbol": symbol,
-            "marginCoin": "USDT",
-            "size": str(close_size),
-            "side": close_side,
-            "orderType": "market",
-            "timeInForceValue": "normal"
-        }
-        
-        body = json.dumps(payload)
-        headers = make_headers("POST", endpoint, body)
-        url = BASE_URL + endpoint
-        
-        print(f"💥 Closing {side_name} position at market: {close_size}")
-        r = requests.post(url, headers=headers, data=body, timeout=15)
-        response_data = r.json()
-        
-        print("🌍 Close response:", response_data)
-        
-        if response_data.get("code") in (0, "0"):
-            print("✅ Close order placed successfully at market price")
+        all_closed = True
+        for pos in positions:
+            if pos["holdSide"] == "long":
+                close_side = "close_long"
+            else:
+                close_side = "close_short"
             
-            # Wait and verify
-            for i in range(8):
-                time.sleep(1)
-                new_side, new_total, _ = get_current_position(symbol)
-                if new_total == 0:
-                    print("✅ Position confirmed closed")
-                    return True
-                print(f"⏳ Waiting for close to complete... {i+1}/8")
+            close_size = pos["available"] if pos["available"] > 0 else pos["total"]
             
-            print("⚠️ Close may still be processing")
+            # Close this position
+            endpoint = "/api/mix/v1/order/placeOrder"
+            payload = {
+                "symbol": symbol,
+                "marginCoin": "USDT",
+                "size": str(close_size),
+                "side": close_side,
+                "orderType": "market",
+                "timeInForceValue": "normal"
+            }
+            
+            body = json.dumps(payload)
+            headers = make_headers("POST", endpoint, body)
+            url = BASE_URL + endpoint
+            
+            print(f"💥 Closing {pos['holdSide']}: {close_size}")
+            r = requests.post(url, headers=headers, data=body, timeout=15)
+            response_data = r.json()
+            
+            print("🌍 Close response:", response_data)
+            
+            if response_data.get("code") not in (0, "0"):
+                all_closed = False
+                print(f"❌ Failed to close {pos['holdSide']}")
+        
+        # Wait for closures to process
+        print("⏳ Waiting for positions to close...")
+        time.sleep(5)
+        
+        # Verify all positions are closed
+        remaining_positions = get_all_positions(symbol)
+        if not remaining_positions:
+            print("✅ All positions closed successfully")
             return True
         else:
-            print(f"❌ Close failed: {response_data.get('msg')}")
+            print(f"❌ Still {len(remaining_positions)} positions remaining")
             return False
             
     except Exception as e:
-        print("❌ Error closing position:", e)
+        print("❌ Error in close_all_positions:", e)
         return False
 
-# === Open position at market price ===
-def open_position_market(symbol, side, size=None):
-    """Open position at market price"""
+# === OPEN POSITION ===
+def open_position(symbol, side):
+    """Open a new position"""
     try:
-        if not size:
-            size = round(TRADE_BALANCE * 3, 6)
-        
-        if size <= 0:
+        trade_size = round(TRADE_BALANCE * 3, 6)
+        if trade_size <= 0:
             print("❌ Invalid trade size")
             return False
         
@@ -152,7 +153,7 @@ def open_position_market(symbol, side, size=None):
         payload = {
             "symbol": symbol,
             "marginCoin": "USDT",
-            "size": str(size),
+            "size": str(trade_size),
             "side": order_side,
             "orderType": "market",
             "timeInForceValue": "normal"
@@ -162,14 +163,14 @@ def open_position_market(symbol, side, size=None):
         headers = make_headers("POST", endpoint, body)
         url = BASE_URL + endpoint
         
-        print(f"📈 Opening {side_name} at market: {size} USDT")
+        print(f"📈 Opening {side_name}: {trade_size} USDT")
         r = requests.post(url, headers=headers, data=body, timeout=15)
         response_data = r.json()
         
         print("🌍 Open response:", response_data)
         
         if response_data.get("code") in (0, "0"):
-            print(f"✅ {side_name} position opened successfully at market price")
+            print(f"✅ {side_name} position opened successfully")
             return True
         else:
             print(f"❌ Open failed: {response_data.get('msg')}")
@@ -179,82 +180,49 @@ def open_position_market(symbol, side, size=None):
         print("❌ Error opening position:", e)
         return False
 
-# === NEW: Handle TradingView alert commands ===
-def handle_tradingview_alert(symbol, action, side=None):
-    """
-    Handle TradingView alert commands:
-    - 'close': Close any existing position
-    - 'open_long': Open long position (closes any existing first)
-    - 'open_short': Open short position (closes any existing first) 
-    - 'reverse_long': Close any position and open long
-    - 'reverse_short': Close any position and open short
-    """
-    print(f"🎯 Processing {action.upper()} for {symbol}")
-    print("=" * 50)
+# === SIMPLE WORKING STRATEGY ===
+def execute_trade(symbol, side):
+    """SIMPLE & WORKING: Close everything, then open new position"""
+    print(f"🎯 Executing {side.upper()} for {symbol}")
+    print("=" * 60)
     
-    if action == "close":
-        # Just close any existing position
-        return close_position_market(symbol)
+    # STEP 1: Close ALL positions (both long and short)
+    print("1️⃣ STEP 1: Closing ALL existing positions...")
+    if not close_all_positions(symbol):
+        print("❌ Failed to close positions, aborting")
+        return
     
-    elif action == "open_long":
-        # Close any existing position first, then open long
-        close_position_market(symbol)
-        time.sleep(2)
-        return open_position_market(symbol, "buy")
+    # STEP 2: Wait to ensure closures are processed
+    print("2️⃣ STEP 2: Waiting for closures to process...")
+    time.sleep(3)
     
-    elif action == "open_short":
-        # Close any existing position first, then open short  
-        close_position_market(symbol)
-        time.sleep(2)
-        return open_position_market(symbol, "sell")
+    # STEP 3: Open new position
+    print(f"3️⃣ STEP 3: Opening new {side.upper()} position...")
+    open_position(symbol, side)
     
-    elif action == "reverse_long":
-        # Close any existing and open long
-        close_position_market(symbol)
-        time.sleep(2)
-        return open_position_market(symbol, "buy")
-    
-    elif action == "reverse_short":
-        # Close any existing and open short
-        close_position_market(symbol)
-        time.sleep(2)
-        return open_position_market(symbol, "sell")
-    
-    else:
-        print(f"❌ Unknown action: {action}")
-        return False
+    print("=" * 60)
 
-# === Webhook for TradingView alerts ===
+# === Webhook ===
 @app.route('/webhook', methods=['POST'])
 def webhook():
     try:
-        print("🚀 TradingView Webhook triggered!")
+        print("🚀 Webhook triggered!")
         data = request.get_json(force=True)
         print("📩 Received payload:", data)
         
         symbol = data.get("symbol")
-        action = data.get("action")  # close, open_long, open_short, reverse_long, reverse_short
-        side = data.get("side")      # buy, sell (for backward compatibility)
+        side = data.get("side")
         
-        if not symbol:
-            return jsonify({"error": "missing symbol"}), 400
+        if not symbol or not side:
+            return jsonify({"error": "missing symbol or side"}), 400
         
-        # Backward compatibility: if action not provided, use side
-        if not action and side:
-            if side.lower() == "buy":
-                action = "reverse_long"
-            else:
-                action = "reverse_short"
-        elif not action:
-            return jsonify({"error": "missing action or side"}), 400
+        if side.lower() not in ['buy', 'sell']:
+            return jsonify({"error": "side must be 'buy' or 'sell'"}), 400
         
-        # Process the alert
-        success = handle_tradingview_alert(symbol, action)
+        # Execute the trade
+        execute_trade(symbol, side)
         
-        if success:
-            return jsonify({"status": "success", "action": action, "symbol": symbol}), 200
-        else:
-            return jsonify({"status": "error", "action": action, "symbol": symbol}), 500
+        return jsonify({"status": "executed"}), 200
         
     except Exception as e:
         print("❌ Webhook Error:", e)
@@ -262,44 +230,22 @@ def webhook():
 
 @app.route('/')
 def home():
-    return """
-    ✅ Bitget TradingView Bot - WORKING
-    
-    Available actions:
-    - close: Close any existing position
-    - open_long: Close any existing and open LONG
-    - open_short: Close any existing and open SHORT  
-    - reverse_long: Close any existing and open LONG
-    - reverse_short: Close any existing and open SHORT
-    
-    Usage in TradingView:
-    {
-      "symbol": "BTCUSDT_UMCBL",
-      "action": "reverse_long"
-    }
-    """
+    return "✅ Bitget Bot - SIMPLE & WORKING"
 
 @app.route('/position/<symbol>', methods=['GET'])
 def check_position(symbol):
-    """Check current position"""
-    side, total, available = get_current_position(symbol)
+    """Check current positions"""
+    positions = get_all_positions(symbol)
     return jsonify({
         "symbol": symbol,
-        "position_side": side,
-        "position_size": total,
-        "available": available
+        "positions": positions,
+        "total_positions": len(positions)
     })
 
 @app.route('/close/<symbol>', methods=['POST'])
-def close_position_manual(symbol):
+def close_manual(symbol):
     """Manual close endpoint"""
-    success = close_position_market(symbol)
-    return jsonify({"status": "success" if success else "error"})
-
-@app.route('/open/<symbol>/<side>', methods=['POST'])
-def open_position_manual(symbol, side):
-    """Manual open endpoint"""
-    success = open_position_market(symbol, side)
+    success = close_all_positions(symbol)
     return jsonify({"status": "success" if success else "error"})
 
 if __name__ == "__main__":
