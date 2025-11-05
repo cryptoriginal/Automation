@@ -5,6 +5,8 @@ import hashlib
 import json
 import requests
 from flask import Flask, request, jsonify
+import threading
+from queue import Queue
 
 app = Flask(__name__)
 
@@ -14,6 +16,10 @@ SECRET_KEY = os.getenv("BINGX_SECRET_KEY")
 TRADE_BALANCE = float(os.getenv("TRADE_BALANCE_USDT", "50"))
 
 BASE_URL = "https://open-api.bingx.com"
+
+# Trade queue to prevent overlapping executions
+trade_queue = Queue()
+current_processing = False
 
 # === BingX Signature ===
 def bingx_signature(params, secret_key):
@@ -31,53 +37,6 @@ def bingx_headers():
         "X-BX-APIKEY": API_KEY,
         "Content-Type": "application/json"
     }
-
-# === Get Account Balance - FIXED ===
-def get_account_balance():
-    """Get available USDT balance - FIXED VERSION"""
-    try:
-        params = {
-            "timestamp": int(time.time() * 1000)
-        }
-        
-        signature = bingx_signature(params, SECRET_KEY)
-        params["signature"] = signature
-        
-        url = f"{BASE_URL}/openApi/swap/v2/user/balance"
-        response = requests.get(url, headers=bingx_headers(), params=params, timeout=10)
-        data = response.json()
-        
-        print(f"💰 Balance response: {data}")
-        
-        if data.get("code") == 0 and "data" in data:
-            balance_data = data["data"]
-            
-            # Handle different response formats
-            if isinstance(balance_data, dict):
-                # If it's a dictionary, extract the balance
-                available_balance = float(balance_data.get("availableBalance", 
-                                        balance_data.get("balance", 
-                                        balance_data.get("totalBalance", TRADE_BALANCE))))
-            elif isinstance(balance_data, list) and len(balance_data) > 0:
-                # If it's a list, find USDT balance
-                for asset in balance_data:
-                    if asset.get("asset") == "USDT":
-                        available_balance = float(asset.get("availableBalance", TRADE_BALANCE))
-                        break
-                else:
-                    available_balance = TRADE_BALANCE
-            else:
-                available_balance = TRADE_BALANCE
-            
-            print(f"💰 Available Balance: {available_balance} USDT")
-            return available_balance
-        
-        # If API call fails, return TRADE_BALANCE as fallback
-        return TRADE_BALANCE
-        
-    except Exception as e:
-        print(f"❌ Error getting balance: {e}")
-        return TRADE_BALANCE
 
 # === Get Current Position ===
 def get_current_position(symbol):
@@ -146,9 +105,9 @@ def set_leverage(symbol, leverage=10):
         print(f"❌ Error setting leverage: {e}")
         return False
 
-# === Calculate Position Size - SIMPLIFIED ===
+# === Calculate Position Size - EXACT 3x ===
 def calculate_position_size():
-    """Calculate position size - EXACTLY 3x of TRADE_BALANCE (No balance check)"""
+    """Calculate position size - EXACTLY 3x of TRADE_BALANCE"""
     position_size = TRADE_BALANCE * 3
     print(f"💰 Trade Balance: {TRADE_BALANCE} USDT")
     print(f"📊 Position Size (3x): {position_size} USDT")
@@ -236,7 +195,7 @@ def open_position(symbol, side, quantity):
 
 # === Execute Trade Logic ===
 def execute_trade(symbol, action):
-    """Main trade execution logic - WORKS WITH ANY PAIR"""
+    """Main trade execution logic"""
     print(f"🎯 Executing {action} for {symbol}")
     print("=" * 60)
     
@@ -250,7 +209,7 @@ def execute_trade(symbol, action):
     
     if trade_size <= 5:
         print("❌ Position size too small")
-        return
+        return False
     
     print(f"📊 Final Position Size: {trade_size} USDT")
     
@@ -266,11 +225,12 @@ def execute_trade(symbol, action):
             time.sleep(3)
         else:
             print("❌ Failed to close existing position, aborting trade")
-            return
+            return False
     else:
         print("✅ No existing position to close")
     
     # STEP 4: Open new position
+    success = False
     if action.upper() == "BUY":
         print("📈 Opening LONG position...")
         success = open_position(symbol, "BUY", trade_size)
@@ -284,8 +244,35 @@ def execute_trade(symbol, action):
         print("❌ Trade failed")
     
     print("=" * 60)
+    return success
 
-# === Webhook Endpoint ===
+# === Process Trade Queue ===
+def process_trade_queue():
+    """Process trades from the queue one by one"""
+    global current_processing
+    
+    while not trade_queue.empty():
+        if current_processing:
+            print("⏳ Another trade is currently processing, waiting...")
+            time.sleep(2)
+            continue
+            
+        current_processing = True
+        trade_data = trade_queue.get()
+        
+        try:
+            symbol = trade_data['symbol']
+            side = trade_data['side']
+            print(f"🔄 Processing queued trade: {symbol} - {side}")
+            execute_trade(symbol, side)
+        except Exception as e:
+            print(f"❌ Error processing queued trade: {e}")
+        finally:
+            current_processing = False
+            trade_queue.task_done()
+            time.sleep(1)  # Small delay between queued trades
+
+# === Webhook Endpoint with Queue ===
 @app.route('/webhook', methods=['POST'])
 def webhook():
     try:
@@ -302,33 +289,76 @@ def webhook():
         if side.upper() not in ['BUY', 'SELL']:
             return jsonify({"error": "side must be 'BUY' or 'SELL'"}), 400
         
-        # Execute the trade for ANY pair
-        execute_trade(symbol, side.upper())
+        # Add trade to queue and process immediately
+        trade_queue.put({'symbol': symbol, 'side': side.upper()})
         
-        return jsonify({"status": "success", "message": "Trade executed"}), 200
+        # Start processing in background thread
+        thread = threading.Thread(target=process_trade_queue)
+        thread.daemon = True
+        thread.start()
+        
+        return jsonify({
+            "status": "queued", 
+            "message": "Trade added to queue",
+            "symbol": symbol,
+            "side": side,
+            "position_size": TRADE_BALANCE * 3
+        }), 200
         
     except Exception as e:
         print(f"❌ Webhook Error: {e}")
+        return jsonify({"error": str(e)}), 500
+
+# === Direct Trade Endpoint (Bypass queue) ===
+@app.route('/trade', methods=['POST'])
+def direct_trade():
+    """Direct trade endpoint for immediate execution"""
+    try:
+        print("🎯 Direct Trade Request!")
+        data = request.get_json(force=True)
+        print(f"📩 Received payload: {data}")
+        
+        symbol = data.get("symbol")
+        side = data.get("side")
+        
+        if not symbol or not side:
+            return jsonify({"error": "missing symbol or side"}), 400
+        
+        if side.upper() not in ['BUY', 'SELL']:
+            return jsonify({"error": "side must be 'BUY' or 'SELL'"}), 400
+        
+        # Execute trade immediately
+        success = execute_trade(symbol, side.upper())
+        
+        return jsonify({
+            "status": "executed" if success else "failed",
+            "symbol": symbol,
+            "side": side,
+            "position_size": TRADE_BALANCE * 3
+        }), 200
+        
+    except Exception as e:
+        print(f"❌ Direct Trade Error: {e}")
         return jsonify({"error": str(e)}), 500
 
 # === Utility Endpoints ===
 @app.route('/')
 def home():
     return """
-    ✅ BingX Trading Bot - ACTIVE
+    ✅ BingX Trading Bot - RELIABLE VERSION
     
     Usage:
-    - Send POST to /webhook with JSON:
+    - Send POST to /webhook with JSON (Queued):
       {"symbol": "SOL-USDT", "side": "BUY"}
-      {"symbol": "SUI-USDT", "side": "SELL"} 
-      {"symbol": "BTC-USDT", "side": "BUY"}
-      (Works with ANY BingX futures pair)
+    
+    - Send POST to /trade with JSON (Immediate):
+      {"symbol": "SUI-USDT", "side": "SELL"}
     
     Features:
-    - 3x position size of TRADE_BALANCE
-    - 10x leverage for sufficient margin
-    - Closes existing positions first
-    - Works with ANY trading pair
+    - 🎯 EXACT 3x position size of TRADE_BALANCE
+    - ⚡ Trade queue to prevent missed signals
+    - 🔄 Processes one trade at a time
+    - ✅ Works with ALL trading pairs
     """
 
 @app.route('/position/<symbol>', methods=['GET'])
@@ -342,12 +372,12 @@ def check_position(symbol):
         "position_size": TRADE_BALANCE * 3
     })
 
-@app.route('/balance', methods=['GET'])
-def check_balance():
-    """Check available balance"""
-    balance = get_account_balance()
+@app.route('/queue', methods=['GET'])
+def check_queue():
+    """Check trade queue status"""
     return jsonify({
-        "available_balance": balance,
+        "queue_size": trade_queue.qsize(),
+        "currently_processing": current_processing,
         "trade_balance": TRADE_BALANCE,
         "position_size": TRADE_BALANCE * 3
     })
@@ -363,8 +393,9 @@ def close_position_manual(symbol):
         return jsonify({"status": "no_position"})
 
 if __name__ == "__main__":
-    print("🔷 Starting BingX Trading Bot")
+    print("🔷 Starting BingX Trading Bot - RELIABLE VERSION")
     print(f"💰 Trade Balance: {TRADE_BALANCE} USDT")
-    print(f"📊 Position Size (3x): {TRADE_BALANCE * 3} USDT")
+    print(f"📊 Position Size (EXACT 3x): {TRADE_BALANCE * 3} USDT")
     print("🎯 Supports ALL trading pairs")
+    print("⚡ Trade queue enabled to prevent missed signals")
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 10000)))
