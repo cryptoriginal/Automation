@@ -9,8 +9,6 @@ import threading
 import logging
 from datetime import datetime
 from queue import Queue
-import redis
-import atexit
 
 app = Flask(__name__)
 
