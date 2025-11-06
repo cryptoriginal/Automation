@@ -117,17 +117,20 @@ def bingx_signature(params):
 def bingx_headers():
     return {"X-BX-APIKEY": API_KEY, "Content-Type": "application/json"}
 
-# === SIMPLIFIED: One-Way Mode Position Open ===
+# === FIXED: One-Way Mode Position Open ===
 def open_position_one_way(symbol, side):
-    """Open position in one-way mode (automatically handles position reversal)"""
+    """Open position in one-way mode - FIXED VERSION"""
     try:
-        # In one-way mode, use "BOTH" for positionSide
         quantity = TRADE_BALANCE * 3
+        
+        # FIX: In one-way mode, use "LONG" for BUY and "SHORT" for SELL
+        # But don't use "BOTH" as it's not recognized
+        position_side = "LONG" if side == "BUY" else "SHORT"
         
         params = {
             "symbol": symbol,
             "side": side,
-            "positionSide": "BOTH",  # ONE-WAY MODE: Use BOTH for automatic position management
+            "positionSide": position_side,  # FIXED: Use LONG/SHORT instead of BOTH
             "type": "MARKET",
             "quantity": quantity,
             "timestamp": int(time.time() * 1000)
@@ -150,7 +153,8 @@ def open_position_one_way(symbol, side):
             logger.info(f"✅ ONE-WAY SUCCESS: {symbol} {side}")
             return True
         else:
-            logger.error(f"❌ ONE-WAY FAILED: {data.get('msg')}")
+            error_msg = data.get('msg', 'Unknown error')
+            logger.error(f"❌ ONE-WAY FAILED: {error_msg}")
             return False
             
     except Exception as e:
@@ -161,21 +165,39 @@ def open_position_one_way(symbol, side):
 def set_leverage(symbol, leverage=10):
     """Set leverage for the symbol"""
     try:
-        # In one-way mode, we don't need separate LONG/SHORT leverage settings
-        params = {
+        # Set for LONG side
+        params_long = {
             "symbol": symbol,
             "leverage": leverage,
-            "side": "LONG",  # Just use LONG for one-way mode
+            "side": "LONG",
             "timestamp": int(time.time() * 1000)
         }
         
-        signature = bingx_signature(params)
-        params["signature"] = signature
+        signature_long = bingx_signature(params_long)
+        params_long["signature"] = signature_long
         
-        response = requests.post(
+        response_long = requests.post(
             f"{BASE_URL}/openApi/swap/v2/trade/leverage",
             headers=bingx_headers(),
-            json=params,
+            json=params_long,
+            timeout=10
+        )
+        
+        # Set for SHORT side
+        params_short = {
+            "symbol": symbol,
+            "leverage": leverage,
+            "side": "SHORT", 
+            "timestamp": int(time.time() * 1000)
+        }
+        
+        signature_short = bingx_signature(params_short)
+        params_short["signature"] = signature_short
+        
+        response_short = requests.post(
+            f"{BASE_URL}/openApi/swap/v2/trade/leverage",
+            headers=bingx_headers(),
+            json=params_short,
             timeout=10
         )
         
@@ -185,9 +207,9 @@ def set_leverage(symbol, leverage=10):
         logger.error(f"❌ Leverage error: {e}")
         return False
 
-# === SIMPLIFIED: One-Way Trade Execution ===
+# === FIXED: One-Way Trade Execution ===
 def execute_trade_one_way(symbol, action, endpoint_name):
-    """Simplified one-way trade execution - NO manual position closing needed"""
+    """Simplified one-way trade execution - FIXED VERSION"""
     
     # Check if we should execute (smart coordination)
     if not trade_tracker.should_execute_trade(symbol, action):
@@ -207,7 +229,6 @@ def execute_trade_one_way(symbol, action, endpoint_name):
         set_leverage(symbol, 10)
         
         # STEP 2: Open position directly (one-way mode handles everything)
-        # In one-way mode, opening opposite position automatically closes existing one
         logger.info(f"📈 Opening {action} position (one-way mode)")
         success = open_position_one_way(symbol, action)
         
@@ -331,17 +352,16 @@ def test_trade(symbol, side):
 @app.route('/')
 def home():
     return """
-    ✅ BINGX BOT - ONE-WAY MODE
+    ✅ BINGX BOT - ONE-WAY MODE (FIXED)
     
     🔄 WEBHOOK ENDPOINTS:
     - PRIMARY: POST /webhook (main execution)
     - BACKUP:  POST /backup (only if primary fails)
     
-    🎯 ONE-WAY MODE FEATURES:
-    - Automatic position reversal
-    - No manual closing needed
-    - Uses "BOTH" for positionSide
-    - Simplified execution
+    🎯 FIXED ONE-WAY MODE:
+    - Uses LONG/SHORT positionSide (not BOTH)
+    - Proper symbol format
+    - Automatic position reversal in one-way mode
     - Smart backup coordination
     
     📝 SETUP:
@@ -352,10 +372,10 @@ def home():
 
 # === Startup ===
 if __name__ == "__main__":
-    logger.info("🔷 Starting BINGX BOT - ONE-WAY MODE")
+    logger.info("🔷 Starting BINGX BOT - ONE-WAY MODE (FIXED)")
     logger.info(f"💰 Trade Balance: {TRADE_BALANCE} USDT")
     logger.info(f"📊 Position Size: {TRADE_BALANCE * 3} USDT")
-    logger.info("🎯 ONE-WAY MODE: Automatic position reversal")
+    logger.info("🎯 ONE-WAY MODE: Using LONG/SHORT positionSide")
     logger.info("🛡️ Smart backup system enabled")
     
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 10000)))
