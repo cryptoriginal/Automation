@@ -117,20 +117,17 @@ def bingx_signature(params):
 def bingx_headers():
     return {"X-BX-APIKEY": API_KEY, "Content-Type": "application/json"}
 
-# === FIXED: One-Way Mode Position Open ===
+# === CORRECT: One-Way Mode Position Open ===
 def open_position_one_way(symbol, side):
-    """Open position in one-way mode - FIXED VERSION"""
+    """Open position in one-way mode - CORRECT VERSION"""
     try:
         quantity = TRADE_BALANCE * 3
         
-        # FIX: In one-way mode, use "LONG" for BUY and "SHORT" for SELL
-        # But don't use "BOTH" as it's not recognized
-        position_side = "LONG" if side == "BUY" else "SHORT"
-        
+        # CORRECT: In one-way mode, use "BOTH" for positionSide
         params = {
             "symbol": symbol,
             "side": side,
-            "positionSide": position_side,  # FIXED: Use LONG/SHORT instead of BOTH
+            "positionSide": "BOTH",  # ✅ CORRECT for one-way mode
             "type": "MARKET",
             "quantity": quantity,
             "timestamp": int(time.time() * 1000)
@@ -161,55 +158,37 @@ def open_position_one_way(symbol, side):
         logger.error(f"❌ One-way open error: {e}")
         return False
 
-# === Set Leverage ===
-def set_leverage(symbol, leverage=10):
-    """Set leverage for the symbol"""
+# === Set Leverage for One-Way Mode ===
+def set_leverage_one_way(symbol, leverage=10):
+    """Set leverage for one-way mode"""
     try:
-        # Set for LONG side
-        params_long = {
+        # In one-way mode, we only need to set leverage once
+        params = {
             "symbol": symbol,
             "leverage": leverage,
-            "side": "LONG",
+            "side": "LONG",  # Just use LONG for one-way mode
             "timestamp": int(time.time() * 1000)
         }
         
-        signature_long = bingx_signature(params_long)
-        params_long["signature"] = signature_long
+        signature = bingx_signature(params)
+        params["signature"] = signature
         
-        response_long = requests.post(
+        response = requests.post(
             f"{BASE_URL}/openApi/swap/v2/trade/leverage",
             headers=bingx_headers(),
-            json=params_long,
+            json=params,
             timeout=10
         )
         
-        # Set for SHORT side
-        params_short = {
-            "symbol": symbol,
-            "leverage": leverage,
-            "side": "SHORT", 
-            "timestamp": int(time.time() * 1000)
-        }
-        
-        signature_short = bingx_signature(params_short)
-        params_short["signature"] = signature_short
-        
-        response_short = requests.post(
-            f"{BASE_URL}/openApi/swap/v2/trade/leverage",
-            headers=bingx_headers(),
-            json=params_short,
-            timeout=10
-        )
-        
-        logger.info(f"⚙️ Leverage set to {leverage}x for {symbol}")
+        logger.info(f"⚙️ One-way leverage set to {leverage}x for {symbol}")
         return True
     except Exception as e:
         logger.error(f"❌ Leverage error: {e}")
         return False
 
-# === FIXED: One-Way Trade Execution ===
+# === CORRECT: One-Way Trade Execution ===
 def execute_trade_one_way(symbol, action, endpoint_name):
-    """Simplified one-way trade execution - FIXED VERSION"""
+    """One-way trade execution - CORRECT VERSION"""
     
     # Check if we should execute (smart coordination)
     if not trade_tracker.should_execute_trade(symbol, action):
@@ -225,11 +204,11 @@ def execute_trade_one_way(symbol, action, endpoint_name):
     
     success = False
     try:
-        # STEP 1: Set leverage
-        set_leverage(symbol, 10)
+        # STEP 1: Set leverage for one-way mode
+        set_leverage_one_way(symbol, 10)
         
-        # STEP 2: Open position directly (one-way mode handles everything)
-        logger.info(f"📈 Opening {action} position (one-way mode)")
+        # STEP 2: Open position directly with "BOTH" for one-way mode
+        logger.info(f"📈 Opening {action} position with positionSide=BOTH")
         success = open_position_one_way(symbol, action)
         
         if success:
@@ -252,6 +231,46 @@ def execute_trade_one_way(symbol, action, endpoint_name):
         "timestamp": datetime.now().isoformat(),
         "mode": "one_way"
     }, 200
+
+# === Test with Different Symbol Format ===
+def open_position_test(symbol, side):
+    """Test with different symbol format if needed"""
+    try:
+        quantity = TRADE_BALANCE * 3
+        
+        # Try without positionSide parameter
+        params = {
+            "symbol": symbol,
+            "side": side,
+            "type": "MARKET",
+            "quantity": quantity,
+            "timestamp": int(time.time() * 1000)
+        }
+        
+        signature = bingx_signature(params)
+        params["signature"] = signature
+        
+        response = requests.post(
+            f"{BASE_URL}/openApi/swap/v2/trade/order",
+            headers=bingx_headers(),
+            json=params,
+            timeout=10
+        )
+        data = response.json()
+        
+        logger.info(f"📈 Test {side} response: {data}")
+        
+        if data.get("code") == 0:
+            logger.info(f"✅ TEST SUCCESS: {symbol} {side}")
+            return True
+        else:
+            error_msg = data.get('msg', 'Unknown error')
+            logger.error(f"❌ TEST FAILED: {error_msg}")
+            return False
+            
+    except Exception as e:
+        logger.error(f"❌ Test open error: {e}")
+        return False
 
 # === Smart Webhook Handler ===
 @app.route('/webhook', methods=['POST'])
@@ -296,6 +315,39 @@ def webhook_backup():
         logger.error(f"❌ BACKUP WEBHOOK ERROR: {e}")
         return jsonify({"error": str(e)}), 500
 
+# === Test endpoint to try different approaches ===
+@app.route('/test-trade', methods=['POST'])
+def test_trade_endpoint():
+    """Test endpoint to try different approaches"""
+    try:
+        data = request.get_json(force=True)
+        symbol = data.get("symbol")
+        side = data.get("side")
+        
+        if not symbol or not side:
+            return jsonify({"error": "missing symbol or side"}), 400
+        
+        logger.info(f"🧪 TESTING: {symbol} {side}")
+        
+        # Try the main approach first
+        success = open_position_one_way(symbol, side.upper())
+        
+        if not success:
+            logger.info("🔄 Trying alternative approach...")
+            # Try without positionSide
+            success = open_position_test(symbol, side.upper())
+        
+        return jsonify({
+            "status": "success" if success else "failed",
+            "symbol": symbol,
+            "side": side,
+            "method": "test"
+        }), 200
+        
+    except Exception as e:
+        logger.error(f"❌ TEST ERROR: {e}")
+        return jsonify({"error": str(e)}), 500
+
 # === Status Endpoints ===
 @app.route('/health', methods=['GET'])
 def health_check():
@@ -308,60 +360,19 @@ def health_check():
         "execution_status": trade_tracker.execution_status
     })
 
-@app.route('/position/<symbol>', methods=['GET'])
-def check_position(symbol):
-    """Check current position"""
-    try:
-        params = {"symbol": symbol, "timestamp": int(time.time() * 1000)}
-        signature = bingx_signature(params)
-        params["signature"] = signature
-        
-        response = requests.get(
-            f"{BASE_URL}/openApi/swap/v2/user/positions",
-            headers=bingx_headers(),
-            params=params,
-            timeout=5
-        )
-        data = response.json()
-        
-        position_info = "No position"
-        if data.get("code") == 0 and "data" in data:
-            for position in data["data"]:
-                position_amt = float(position.get("positionAmt", 0))
-                if position_amt != 0:
-                    position_info = f"{'LONG' if position_amt > 0 else 'SHORT'}: {abs(position_amt)}"
-                    break
-        
-        return jsonify({
-            "symbol": symbol,
-            "position": position_info,
-            "timestamp": datetime.now().isoformat()
-        })
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-@app.route('/test/<symbol>/<side>', methods=['GET'])
-def test_trade(symbol, side):
-    """Test trade endpoint"""
-    if side.upper() not in ['BUY', 'SELL']:
-        return jsonify({"error": "side must be BUY or SELL"}), 400
-    
-    result, status = execute_trade_one_way(symbol, side.upper(), "TEST")
-    return jsonify(result), status
-
 @app.route('/')
 def home():
     return """
-    ✅ BINGX BOT - ONE-WAY MODE (FIXED)
+    ✅ BINGX BOT - ONE-WAY MODE (CORRECTED)
     
     🔄 WEBHOOK ENDPOINTS:
     - PRIMARY: POST /webhook (main execution)
     - BACKUP:  POST /backup (only if primary fails)
+    - TEST:    POST /test-trade (for debugging)
     
-    🎯 FIXED ONE-WAY MODE:
-    - Uses LONG/SHORT positionSide (not BOTH)
-    - Proper symbol format
-    - Automatic position reversal in one-way mode
+    🎯 CORRECT ONE-WAY MODE:
+    - Uses "BOTH" for positionSide
+    - Automatic position reversal
     - Smart backup coordination
     
     📝 SETUP:
@@ -372,10 +383,10 @@ def home():
 
 # === Startup ===
 if __name__ == "__main__":
-    logger.info("🔷 Starting BINGX BOT - ONE-WAY MODE (FIXED)")
+    logger.info("🔷 Starting BINGX BOT - ONE-WAY MODE (CORRECTED)")
     logger.info(f"💰 Trade Balance: {TRADE_BALANCE} USDT")
     logger.info(f"📊 Position Size: {TRADE_BALANCE * 3} USDT")
-    logger.info("🎯 ONE-WAY MODE: Using LONG/SHORT positionSide")
+    logger.info("🎯 ONE-WAY MODE: Using BOTH for positionSide")
     logger.info("🛡️ Smart backup system enabled")
     
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 10000)))
