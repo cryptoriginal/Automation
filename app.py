@@ -117,17 +117,30 @@ def bingx_signature(params):
 def bingx_headers():
     return {"X-BX-APIKEY": API_KEY, "Content-Type": "application/json"}
 
+# === Symbol Format Converter ===
+def convert_to_bingx_symbol(symbol):
+    """Convert TradingView symbol to BingX futures symbol format"""
+    # Remove -USDT if present and add -USDT-SWAP for futures
+    if symbol.endswith('-USDT'):
+        base_symbol = symbol.replace('-USDT', '')
+        return f"{base_symbol}-USDT-SWAP"
+    else:
+        return f"{symbol}-USDT-SWAP"
+
 # === CORRECT: One-Way Mode Position Open ===
 def open_position_one_way(symbol, side):
-    """Open position in one-way mode - CORRECT VERSION"""
+    """Open position in one-way mode with correct symbol format"""
     try:
         quantity = TRADE_BALANCE * 3
         
-        # CORRECT: In one-way mode, use "BOTH" for positionSide
+        # Convert symbol to BingX futures format
+        bingx_symbol = convert_to_bingx_symbol(symbol)
+        logger.info(f"🔤 Converted {symbol} -> {bingx_symbol}")
+        
         params = {
-            "symbol": symbol,
+            "symbol": bingx_symbol,  # Use converted symbol
             "side": side,
-            "positionSide": "BOTH",  # ✅ CORRECT for one-way mode
+            "positionSide": "BOTH",  # Correct for one-way mode
             "type": "MARKET",
             "quantity": quantity,
             "timestamp": int(time.time() * 1000)
@@ -147,7 +160,7 @@ def open_position_one_way(symbol, side):
         logger.info(f"📈 One-way {side} response: {data}")
         
         if data.get("code") == 0:
-            logger.info(f"✅ ONE-WAY SUCCESS: {symbol} {side}")
+            logger.info(f"✅ ONE-WAY SUCCESS: {bingx_symbol} {side}")
             return True
         else:
             error_msg = data.get('msg', 'Unknown error')
@@ -162,9 +175,11 @@ def open_position_one_way(symbol, side):
 def set_leverage_one_way(symbol, leverage=10):
     """Set leverage for one-way mode"""
     try:
-        # In one-way mode, we only need to set leverage once
+        # Convert symbol to BingX futures format
+        bingx_symbol = convert_to_bingx_symbol(symbol)
+        
         params = {
-            "symbol": symbol,
+            "symbol": bingx_symbol,  # Use converted symbol
             "leverage": leverage,
             "side": "LONG",  # Just use LONG for one-way mode
             "timestamp": int(time.time() * 1000)
@@ -180,7 +195,7 @@ def set_leverage_one_way(symbol, leverage=10):
             timeout=10
         )
         
-        logger.info(f"⚙️ One-way leverage set to {leverage}x for {symbol}")
+        logger.info(f"⚙️ One-way leverage set to {leverage}x for {bingx_symbol}")
         return True
     except Exception as e:
         logger.error(f"❌ Leverage error: {e}")
@@ -188,7 +203,7 @@ def set_leverage_one_way(symbol, leverage=10):
 
 # === CORRECT: One-Way Trade Execution ===
 def execute_trade_one_way(symbol, action, endpoint_name):
-    """One-way trade execution - CORRECT VERSION"""
+    """One-way trade execution with correct symbol format"""
     
     # Check if we should execute (smart coordination)
     if not trade_tracker.should_execute_trade(symbol, action):
@@ -207,8 +222,8 @@ def execute_trade_one_way(symbol, action, endpoint_name):
         # STEP 1: Set leverage for one-way mode
         set_leverage_one_way(symbol, 10)
         
-        # STEP 2: Open position directly with "BOTH" for one-way mode
-        logger.info(f"📈 Opening {action} position with positionSide=BOTH")
+        # STEP 2: Open position directly with correct symbol format
+        logger.info(f"📈 Opening {action} position")
         success = open_position_one_way(symbol, action)
         
         if success:
@@ -231,46 +246,6 @@ def execute_trade_one_way(symbol, action, endpoint_name):
         "timestamp": datetime.now().isoformat(),
         "mode": "one_way"
     }, 200
-
-# === Test with Different Symbol Format ===
-def open_position_test(symbol, side):
-    """Test with different symbol format if needed"""
-    try:
-        quantity = TRADE_BALANCE * 3
-        
-        # Try without positionSide parameter
-        params = {
-            "symbol": symbol,
-            "side": side,
-            "type": "MARKET",
-            "quantity": quantity,
-            "timestamp": int(time.time() * 1000)
-        }
-        
-        signature = bingx_signature(params)
-        params["signature"] = signature
-        
-        response = requests.post(
-            f"{BASE_URL}/openApi/swap/v2/trade/order",
-            headers=bingx_headers(),
-            json=params,
-            timeout=10
-        )
-        data = response.json()
-        
-        logger.info(f"📈 Test {side} response: {data}")
-        
-        if data.get("code") == 0:
-            logger.info(f"✅ TEST SUCCESS: {symbol} {side}")
-            return True
-        else:
-            error_msg = data.get('msg', 'Unknown error')
-            logger.error(f"❌ TEST FAILED: {error_msg}")
-            return False
-            
-    except Exception as e:
-        logger.error(f"❌ Test open error: {e}")
-        return False
 
 # === Smart Webhook Handler ===
 @app.route('/webhook', methods=['POST'])
@@ -315,37 +290,33 @@ def webhook_backup():
         logger.error(f"❌ BACKUP WEBHOOK ERROR: {e}")
         return jsonify({"error": str(e)}), 500
 
-# === Test endpoint to try different approaches ===
-@app.route('/test-trade', methods=['POST'])
-def test_trade_endpoint():
-    """Test endpoint to try different approaches"""
+# === Available Symbols Check ===
+@app.route('/symbols', methods=['GET'])
+def get_available_symbols():
+    """Get available futures symbols from BingX"""
     try:
-        data = request.get_json(force=True)
-        symbol = data.get("symbol")
-        side = data.get("side")
+        params = {"timestamp": int(time.time() * 1000)}
+        signature = bingx_signature(params)
+        params["signature"] = signature
         
-        if not symbol or not side:
-            return jsonify({"error": "missing symbol or side"}), 400
+        response = requests.get(
+            f"{BASE_URL}/openApi/swap/v2/quote/contracts",
+            headers=bingx_headers(),
+            params=params,
+            timeout=10
+        )
+        data = response.json()
         
-        logger.info(f"🧪 TESTING: {symbol} {side}")
-        
-        # Try the main approach first
-        success = open_position_one_way(symbol, side.upper())
-        
-        if not success:
-            logger.info("🔄 Trying alternative approach...")
-            # Try without positionSide
-            success = open_position_test(symbol, side.upper())
+        symbols = []
+        if data.get("code") == 0 and "data" in data:
+            for contract in data["data"]:
+                symbols.append(contract.get("symbol"))
         
         return jsonify({
-            "status": "success" if success else "failed",
-            "symbol": symbol,
-            "side": side,
-            "method": "test"
-        }), 200
-        
+            "available_symbols": sorted(symbols)[:20],  # First 20 symbols
+            "total_count": len(symbols)
+        })
     except Exception as e:
-        logger.error(f"❌ TEST ERROR: {e}")
         return jsonify({"error": str(e)}), 500
 
 # === Status Endpoints ===
@@ -360,33 +331,44 @@ def health_check():
         "execution_status": trade_tracker.execution_status
     })
 
+@app.route('/convert-symbol/<symbol>', methods=['GET'])
+def convert_symbol(symbol):
+    """Convert a symbol to BingX format"""
+    bingx_symbol = convert_to_bingx_symbol(symbol)
+    return jsonify({
+        "input_symbol": symbol,
+        "bingx_symbol": bingx_symbol
+    })
+
 @app.route('/')
 def home():
     return """
-    ✅ BINGX BOT - ONE-WAY MODE (CORRECTED)
+    ✅ BINGX BOT - CORRECT SYMBOL FORMAT
     
     🔄 WEBHOOK ENDPOINTS:
     - PRIMARY: POST /webhook (main execution)
     - BACKUP:  POST /backup (only if primary fails)
-    - TEST:    POST /test-trade (for debugging)
     
-    🎯 CORRECT ONE-WAY MODE:
-    - Uses "BOTH" for positionSide
-    - Automatic position reversal
+    🔧 UTILITY ENDPOINTS:
+    - GET /symbols - Check available symbols
+    - GET /convert-symbol/SUI-USDT - Convert symbol format
+    
+    🎯 CORRECT SYMBOL FORMAT:
+    - TradingView: SUI-USDT → BingX: SUI-USDT-SWAP
+    - Automatic symbol conversion
     - Smart backup coordination
     
     📝 SETUP:
-    - TradingView Alert 1: /webhook
-    - TradingView Alert 2: /backup (as backup)
-    - BingX: ONE-WAY MODE (hedge mode disabled)
+    - TradingView Alert 1: /webhook with {"symbol":"SUI-USDT","side":"BUY"}
+    - TradingView Alert 2: /backup with same message
     """
 
 # === Startup ===
 if __name__ == "__main__":
-    logger.info("🔷 Starting BINGX BOT - ONE-WAY MODE (CORRECTED)")
+    logger.info("🔷 Starting BINGX BOT - CORRECT SYMBOL FORMAT")
     logger.info(f"💰 Trade Balance: {TRADE_BALANCE} USDT")
     logger.info(f"📊 Position Size: {TRADE_BALANCE * 3} USDT")
-    logger.info("🎯 ONE-WAY MODE: Using BOTH for positionSide")
-    logger.info("🛡️ Smart backup system enabled")
+    logger.info("🔤 Automatic symbol conversion enabled")
+    logger.info("🛡️ Smart backup system active")
     
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 10000)))
