@@ -117,77 +117,17 @@ def bingx_signature(params):
 def bingx_headers():
     return {"X-BX-APIKEY": API_KEY, "Content-Type": "application/json"}
 
-# === Fast Position Check ===
-def get_position_fast(symbol):
-    """Fast position check"""
+# === SIMPLIFIED: One-Way Mode Position Open ===
+def open_position_one_way(symbol, side):
+    """Open position in one-way mode (automatically handles position reversal)"""
     try:
-        params = {"symbol": symbol, "timestamp": int(time.time() * 1000)}
-        signature = bingx_signature(params)
-        params["signature"] = signature
-        
-        response = requests.get(
-            f"{BASE_URL}/openApi/swap/v2/user/positions",
-            headers=bingx_headers(),
-            params=params,
-            timeout=5
-        )
-        data = response.json()
-        
-        if data.get("code") == 0 and "data" in data:
-            for position in data["data"]:
-                position_amt = float(position.get("positionAmt", 0))
-                if position_amt != 0:
-                    return "LONG" if position_amt > 0 else "SHORT"
-        return "NONE"
-    except Exception as e:
-        logger.error(f"❌ Position check error: {e}")
-        return "UNKNOWN"
-
-# === Fast Close Position ===
-def close_position_fast(symbol, side):
-    """Fast position close"""
-    try:
-        close_side = "SELL" if side == "LONG" else "BUY"
-        position_side = "LONG" if side == "LONG" else "SHORT"
-        quantity = TRADE_BALANCE * 3
-        
-        params = {
-            "symbol": symbol,
-            "side": close_side,
-            "positionSide": position_side,
-            "type": "MARKET",
-            "quantity": quantity,
-            "timestamp": int(time.time() * 1000)
-        }
-        
-        signature = bingx_signature(params)
-        params["signature"] = signature
-        
-        response = requests.post(
-            f"{BASE_URL}/openApi/swap/v2/trade/order",
-            headers=bingx_headers(),
-            json=params,
-            timeout=10
-        )
-        data = response.json()
-        
-        logger.info(f"🔻 Close {side} response: {data}")
-        return data.get("code") == 0
-    except Exception as e:
-        logger.error(f"❌ Close error: {e}")
-        return False
-
-# === Fast Open Position ===
-def open_position_fast(symbol, side):
-    """Fast position open"""
-    try:
-        position_side = "LONG" if side == "BUY" else "SHORT"
+        # In one-way mode, use "BOTH" for positionSide
         quantity = TRADE_BALANCE * 3
         
         params = {
             "symbol": symbol,
             "side": side,
-            "positionSide": position_side,
+            "positionSide": "BOTH",  # ONE-WAY MODE: Use BOTH for automatic position management
             "type": "MARKET",
             "quantity": quantity,
             "timestamp": int(time.time() * 1000)
@@ -204,49 +144,38 @@ def open_position_fast(symbol, side):
         )
         data = response.json()
         
-        logger.info(f"📈 Open {side} response: {data}")
-        return data.get("code") == 0
+        logger.info(f"📈 One-way {side} response: {data}")
+        
+        if data.get("code") == 0:
+            logger.info(f"✅ ONE-WAY SUCCESS: {symbol} {side}")
+            return True
+        else:
+            logger.error(f"❌ ONE-WAY FAILED: {data.get('msg')}")
+            return False
+            
     except Exception as e:
-        logger.error(f"❌ Open error: {e}")
+        logger.error(f"❌ One-way open error: {e}")
         return False
 
 # === Set Leverage ===
 def set_leverage(symbol, leverage=10):
     """Set leverage for the symbol"""
     try:
-        # Set for LONG side
-        params_long = {
+        # In one-way mode, we don't need separate LONG/SHORT leverage settings
+        params = {
             "symbol": symbol,
             "leverage": leverage,
-            "side": "LONG",
+            "side": "LONG",  # Just use LONG for one-way mode
             "timestamp": int(time.time() * 1000)
         }
         
-        signature_long = bingx_signature(params_long)
-        params_long["signature"] = signature_long
+        signature = bingx_signature(params)
+        params["signature"] = signature
         
-        response_long = requests.post(
+        response = requests.post(
             f"{BASE_URL}/openApi/swap/v2/trade/leverage",
             headers=bingx_headers(),
-            json=params_long,
-            timeout=10
-        )
-        
-        # Set for SHORT side
-        params_short = {
-            "symbol": symbol,
-            "leverage": leverage,
-            "side": "SHORT", 
-            "timestamp": int(time.time() * 1000)
-        }
-        
-        signature_short = bingx_signature(params_short)
-        params_short["signature"] = signature_short
-        
-        response_short = requests.post(
-            f"{BASE_URL}/openApi/swap/v2/trade/leverage",
-            headers=bingx_headers(),
-            json=params_short,
+            json=params,
             timeout=10
         )
         
@@ -256,9 +185,9 @@ def set_leverage(symbol, leverage=10):
         logger.error(f"❌ Leverage error: {e}")
         return False
 
-# === Smart Trade Execution ===
-def execute_trade_smart(symbol, action, endpoint_name):
-    """Smart trade execution with coordination"""
+# === SIMPLIFIED: One-Way Trade Execution ===
+def execute_trade_one_way(symbol, action, endpoint_name):
+    """Simplified one-way trade execution - NO manual position closing needed"""
     
     # Check if we should execute (smart coordination)
     if not trade_tracker.should_execute_trade(symbol, action):
@@ -270,38 +199,25 @@ def execute_trade_smart(symbol, action, endpoint_name):
             "side": action
         }, 200
     
-    logger.info(f"🎯 EXECUTING ({endpoint_name}): {symbol} {action}")
+    logger.info(f"🎯 ONE-WAY EXECUTING ({endpoint_name}): {symbol} {action}")
     
     success = False
     try:
-        # STEP 0: Set leverage
+        # STEP 1: Set leverage
         set_leverage(symbol, 10)
         
-        # STEP 1: Check current position
-        current_position = get_position_fast(symbol)
-        logger.info(f"📊 Current {symbol} position: {current_position}")
-        
-        # STEP 2: Close opposite position if needed
-        if current_position != "NONE" and current_position != "UNKNOWN":
-            if (action == "BUY" and current_position == "SHORT") or (action == "SELL" and current_position == "LONG"):
-                logger.info(f"🔄 Closing {current_position} position")
-                close_success = close_position_fast(symbol, current_position)
-                if close_success:
-                    time.sleep(2)  # Wait for close to process
-        
-        # STEP 3: Open new position
-        logger.info(f"📈 Opening {action} position for {symbol}")
-        open_success = open_position_fast(symbol, action)
-        
-        success = open_success
+        # STEP 2: Open position directly (one-way mode handles everything)
+        # In one-way mode, opening opposite position automatically closes existing one
+        logger.info(f"📈 Opening {action} position (one-way mode)")
+        success = open_position_one_way(symbol, action)
         
         if success:
-            logger.info(f"✅✅✅ TRADE SUCCESS ({endpoint_name}): {symbol} {action}")
+            logger.info(f"✅✅✅ ONE-WAY SUCCESS ({endpoint_name}): {symbol} {action}")
         else:
-            logger.error(f"❌ TRADE FAILED ({endpoint_name}): {symbol} {action}")
+            logger.error(f"❌ ONE-WAY FAILED ({endpoint_name}): {symbol} {action}")
         
     except Exception as e:
-        logger.error(f"💥 EXECUTION ERROR ({endpoint_name}): {e}")
+        logger.error(f"💥 ONE-WAY EXECUTION ERROR ({endpoint_name}): {e}")
         success = False
     
     # Mark trade as completed (success or failure)
@@ -312,7 +228,8 @@ def execute_trade_smart(symbol, action, endpoint_name):
         "endpoint": endpoint_name,
         "symbol": symbol,
         "side": action,
-        "timestamp": datetime.now().isoformat()
+        "timestamp": datetime.now().isoformat(),
+        "mode": "one_way"
     }, 200
 
 # === Smart Webhook Handler ===
@@ -330,7 +247,7 @@ def webhook_primary():
         if side.upper() not in ['BUY', 'SELL']:
             return jsonify({"error": "side must be BUY or SELL"}), 400
         
-        result, status = execute_trade_smart(symbol, side.upper(), "PRIMARY")
+        result, status = execute_trade_one_way(symbol, side.upper(), "PRIMARY")
         return jsonify(result), status
         
     except Exception as e:
@@ -351,7 +268,7 @@ def webhook_backup():
         if side.upper() not in ['BUY', 'SELL']:
             return jsonify({"error": "side must be BUY or SELL"}), 400
         
-        result, status = execute_trade_smart(symbol, side.upper(), "BACKUP")
+        result, status = execute_trade_one_way(symbol, side.upper(), "BACKUP")
         return jsonify(result), status
         
     except Exception as e:
@@ -366,46 +283,79 @@ def health_check():
         "timestamp": datetime.now().isoformat(),
         "trade_balance": TRADE_BALANCE,
         "position_size": TRADE_BALANCE * 3,
+        "mode": "one_way",
         "execution_status": trade_tracker.execution_status
     })
 
 @app.route('/position/<symbol>', methods=['GET'])
 def check_position(symbol):
-    position = get_position_fast(symbol)
-    return jsonify({
-        "symbol": symbol,
-        "position": position,
-        "timestamp": datetime.now().isoformat()
-    })
+    """Check current position"""
+    try:
+        params = {"symbol": symbol, "timestamp": int(time.time() * 1000)}
+        signature = bingx_signature(params)
+        params["signature"] = signature
+        
+        response = requests.get(
+            f"{BASE_URL}/openApi/swap/v2/user/positions",
+            headers=bingx_headers(),
+            params=params,
+            timeout=5
+        )
+        data = response.json()
+        
+        position_info = "No position"
+        if data.get("code") == 0 and "data" in data:
+            for position in data["data"]:
+                position_amt = float(position.get("positionAmt", 0))
+                if position_amt != 0:
+                    position_info = f"{'LONG' if position_amt > 0 else 'SHORT'}: {abs(position_amt)}"
+                    break
+        
+        return jsonify({
+            "symbol": symbol,
+            "position": position_info,
+            "timestamp": datetime.now().isoformat()
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/test/<symbol>/<side>', methods=['GET'])
+def test_trade(symbol, side):
+    """Test trade endpoint"""
+    if side.upper() not in ['BUY', 'SELL']:
+        return jsonify({"error": "side must be BUY or SELL"}), 400
+    
+    result, status = execute_trade_one_way(symbol, side.upper(), "TEST")
+    return jsonify(result), status
 
 @app.route('/')
 def home():
     return """
-    ✅ SMART BINGX BOT - INTELLIGENT BACKUP
+    ✅ BINGX BOT - ONE-WAY MODE
     
     🔄 WEBHOOK ENDPOINTS:
     - PRIMARY: POST /webhook (main execution)
     - BACKUP:  POST /backup (only if primary fails)
     
-    🧠 SMART FEATURES:
-    - Primary executes first
-    - Backup only runs if primary fails
-    - No duplicate executions
-    - 10-second cooldown after success
-    - Stuck execution cleanup
-    - Real-time coordination
+    🎯 ONE-WAY MODE FEATURES:
+    - Automatic position reversal
+    - No manual closing needed
+    - Uses "BOTH" for positionSide
+    - Simplified execution
+    - Smart backup coordination
     
     📝 SETUP:
     - TradingView Alert 1: /webhook
     - TradingView Alert 2: /backup (as backup)
+    - BingX: ONE-WAY MODE (hedge mode disabled)
     """
 
 # === Startup ===
 if __name__ == "__main__":
-    logger.info("🔷 Starting SMART BingX Bot with Intelligent Backup")
+    logger.info("🔷 Starting BINGX BOT - ONE-WAY MODE")
     logger.info(f"💰 Trade Balance: {TRADE_BALANCE} USDT")
     logger.info(f"📊 Position Size: {TRADE_BALANCE * 3} USDT")
-    logger.info("🧠 Intelligent backup system enabled")
-    logger.info("🛡️ Primary executes, backup only runs if primary fails")
+    logger.info("🎯 ONE-WAY MODE: Automatic position reversal")
+    logger.info("🛡️ Smart backup system enabled")
     
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 10000)))
