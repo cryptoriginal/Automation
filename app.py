@@ -126,17 +126,24 @@ def get_current_position(symbol):
         logger.error(f"❌ Position check error: {e}")
         return None
 
-# === Close Position ===
+# === Close Position - FIXED ===
 def close_position(symbol, side, quantity):
-    """Close existing position in hedge mode"""
+    """Close existing position in hedge mode - CORRECTED VERSION"""
     try:
-        # In hedge mode, use close_long/close_short
-        close_side = "close_short" if side == "SHORT" else "close_long"
+        # In hedge mode, use BUY/SELL for side but specify positionSide
+        if side == "LONG":
+            # To close LONG position, we SELL
+            close_side = "SELL"
+            position_side = "LONG"
+        else:  # SHORT
+            # To close SHORT position, we BUY  
+            close_side = "BUY"
+            position_side = "SHORT"
         
         params = {
             "symbol": symbol,
-            "side": close_side,  # close_long or close_short
-            "positionSide": "LONG" if side == "LONG" else "SHORT",
+            "side": close_side,  # BUY or SELL
+            "positionSide": position_side,  # LONG or SHORT
             "type": "MARKET",
             "quantity": quantity,
             "timestamp": int(time.time() * 1000)
@@ -168,22 +175,22 @@ def close_position(symbol, side, quantity):
 
 # === Open Position - FIXED ===
 def open_position(symbol, action):
-    """Open new position in hedge mode - FIXED VERSION"""
+    """Open new position in hedge mode - CORRECTED VERSION"""
     try:
-        # Convert BUY/SELL to hedge mode side values
+        # Use BUY/SELL for side parameter, but specify positionSide for hedge mode
         if action == "BUY":
-            side = "open_long"
+            side = "BUY"
             position_side = "LONG"
         else:  # SELL
-            side = "open_short" 
+            side = "SELL" 
             position_side = "SHORT"
             
         quantity = TRADE_BALANCE * 3
         
         params = {
             "symbol": symbol,
-            "side": side,  # open_long or open_short
-            "positionSide": position_side,
+            "side": side,  # Use BUY/SELL here
+            "positionSide": position_side,  # Use LONG/SHORT for position side
             "type": "MARKET",
             "quantity": quantity,
             "timestamp": int(time.time() * 1000)
@@ -416,31 +423,37 @@ def close_all_positions(symbol):
 @app.route('/')
 def home():
     return """
-    ✅ BINGX BOT - HEDGE MODE (FIXED SIDE PARAMETERS)
+    ✅ BINGX BOT - HEDGE MODE (CORRECTED SIDE PARAMETERS)
     
     🔄 WEBHOOK ENDPOINTS:
     - PRIMARY: POST /webhook (main execution)
     - BACKUP:  POST /backup (only if primary fails)
     
     🛡️ HEDGE MODE FEATURES:
-    - ✅ Uses open_long/open_short for side parameter
+    - ✅ Uses BUY/SELL for side parameter with positionSide
     - ✅ Closes existing position BEFORE opening new one
     - ✅ Never both long and short simultaneously
     - ✅ Proper position reversal
     - ✅ Smart backup coordination
+    - ✅ 3x position size based on TRADE_BALANCE_USDT
     
     📝 SETUP:
     - BingX: HEDGE MODE ENABLED
     - TradingView Alert 1: /webhook with {"symbol":"SUI-USDT","side":"BUY"}
     - TradingView Alert 2: /backup with same message
+    
+    ⚙️ ENVIRONMENT VARIABLES:
+    - BINGX_API_KEY: Your BingX API Key
+    - BINGX_SECRET_KEY: Your BingX Secret Key  
+    - TRADE_BALANCE_USDT: Trade balance (default: 50)
     """
 
 # === Startup ===
 if __name__ == "__main__":
-    logger.info("🔷 Starting BINGX BOT - HEDGE MODE (FIXED)")
+    logger.info("🔷 Starting BINGX BOT - HEDGE MODE (CORRECTED)")
     logger.info(f"💰 Trade Balance: {TRADE_BALANCE} USDT")
     logger.info(f"📊 Position Size: {TRADE_BALANCE * 3} USDT")
-    logger.info("🛡️ HEDGE MODE: Uses open_long/open_short for side parameter")
+    logger.info("🛡️ HEDGE MODE: Uses BUY/SELL with positionSide")
     logger.info("🎯 Smart backup system active")
     
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 10000)))
