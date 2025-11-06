@@ -111,8 +111,6 @@ def get_current_position(symbol):
         )
         data = response.json()
         
-        logger.info(f"📊 Position response: {data}")
-        
         if data.get("code") == 0 and "data" in data:
             positions = data["data"]
             for position in positions:
@@ -132,11 +130,12 @@ def get_current_position(symbol):
 def close_position(symbol, side, quantity):
     """Close existing position in hedge mode"""
     try:
+        # In hedge mode, use close_long/close_short
         close_side = "close_short" if side == "SHORT" else "close_long"
         
         params = {
             "symbol": symbol,
-            "side": close_side,
+            "side": close_side,  # close_long or close_short
             "positionSide": "LONG" if side == "LONG" else "SHORT",
             "type": "MARKET",
             "quantity": quantity,
@@ -167,17 +166,23 @@ def close_position(symbol, side, quantity):
         logger.error(f"❌ Close error: {e}")
         return False
 
-# === Open Position ===
-def open_position(symbol, side):
-    """Open new position in hedge mode"""
+# === Open Position - FIXED ===
+def open_position(symbol, action):
+    """Open new position in hedge mode - FIXED VERSION"""
     try:
-        position_side = "LONG" if side == "BUY" else "SHORT"
-        open_side = "open_long" if side == "BUY" else "open_short"
+        # Convert BUY/SELL to hedge mode side values
+        if action == "BUY":
+            side = "open_long"
+            position_side = "LONG"
+        else:  # SELL
+            side = "open_short" 
+            position_side = "SHORT"
+            
         quantity = TRADE_BALANCE * 3
         
         params = {
             "symbol": symbol,
-            "side": open_side,
+            "side": side,  # open_long or open_short
             "positionSide": position_side,
             "type": "MARKET",
             "quantity": quantity,
@@ -195,10 +200,10 @@ def open_position(symbol, side):
         )
         data = response.json()
         
-        logger.info(f"📈 Open {side} response: {data}")
+        logger.info(f"📈 Open {action} response: {data}")
         
         if data.get("code") == 0:
-            logger.info(f"✅ Position open successful: {symbol} {side}")
+            logger.info(f"✅ Position open successful: {symbol} {action}")
             return True
         else:
             logger.error(f"❌ Open failed: {data.get('msg')}")
@@ -411,31 +416,31 @@ def close_all_positions(symbol):
 @app.route('/')
 def home():
     return """
-    ✅ BINGX BOT - HEDGE MODE (PROPER POSITION MANAGEMENT)
+    ✅ BINGX BOT - HEDGE MODE (FIXED SIDE PARAMETERS)
     
     🔄 WEBHOOK ENDPOINTS:
     - PRIMARY: POST /webhook (main execution)
     - BACKUP:  POST /backup (only if primary fails)
     
     🛡️ HEDGE MODE FEATURES:
+    - ✅ Uses open_long/open_short for side parameter
     - ✅ Closes existing position BEFORE opening new one
     - ✅ Never both long and short simultaneously
     - ✅ Proper position reversal
     - ✅ Smart backup coordination
-    - ✅ Duplicate protection
     
     📝 SETUP:
     - BingX: HEDGE MODE ENABLED
-    - TradingView Alert 1: /webhook
-    - TradingView Alert 2: /backup
+    - TradingView Alert 1: /webhook with {"symbol":"SUI-USDT","side":"BUY"}
+    - TradingView Alert 2: /backup with same message
     """
 
 # === Startup ===
 if __name__ == "__main__":
-    logger.info("🔷 Starting BINGX BOT - HEDGE MODE")
+    logger.info("🔷 Starting BINGX BOT - HEDGE MODE (FIXED)")
     logger.info(f"💰 Trade Balance: {TRADE_BALANCE} USDT")
     logger.info(f"📊 Position Size: {TRADE_BALANCE * 3} USDT")
-    logger.info("🛡️ HEDGE MODE: Closes existing positions before opening new ones")
+    logger.info("🛡️ HEDGE MODE: Uses open_long/open_short for side parameter")
     logger.info("🎯 Smart backup system active")
     
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 10000)))
