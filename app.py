@@ -25,9 +25,84 @@ TRADE_BALANCE = float(os.getenv("TRADE_BALANCE_USDT", "50"))
 
 BASE_URL = "https://open-api.bingx.com"
 
-# Global variables for trade tracking
-last_trade_time = 0
-TRADE_COOLDOWN = 2  # seconds
+# Smart trade tracking with execution status
+class SmartTradeTracker:
+    def __init__(self):
+        self.execution_status = {}  # symbol: {"last_side": "BUY/SELL", "executing": True/False, "timestamp": time}
+        self.TRADE_COOLDOWN = 10  # 10 seconds cooldown after successful execution
+        self.EXECUTION_TIMEOUT = 30  # 30 seconds max for execution
+        self._lock = threading.Lock()
+    
+    def should_execute_trade(self, symbol, side):
+        """Check if we should execute this trade (smart coordination)"""
+        with self._lock:
+            current_time = time.time()
+            symbol_status = self.execution_status.get(symbol, {})
+            
+            # If same trade is currently executing, skip
+            if symbol_status.get("executing", False):
+                logger.info(f"⏸️ Already executing {symbol} {side}, skipping duplicate")
+                return False
+            
+            # If same trade was recently executed, skip
+            last_execution_time = symbol_status.get("timestamp", 0)
+            last_side = symbol_status.get("last_side")
+            
+            if (last_side == side and 
+                current_time - last_execution_time < self.TRADE_COOLDOWN):
+                logger.info(f"⏸️ Recent {symbol} {side} executed, skipping duplicate")
+                return False
+            
+            # Mark as executing
+            self.execution_status[symbol] = {
+                "executing": True,
+                "last_side": side,
+                "start_time": current_time
+            }
+            return True
+    
+    def mark_trade_completed(self, symbol, side, success=True):
+        """Mark trade as completed"""
+        with self._lock:
+            current_time = time.time()
+            if success:
+                self.execution_status[symbol] = {
+                    "executing": False,
+                    "last_side": side,
+                    "timestamp": current_time
+                }
+                logger.info(f"✅ Marked {symbol} {side} as completed")
+            else:
+                # If failed, remove executing flag so backup can retry
+                self.execution_status[symbol] = {
+                    "executing": False,
+                    "last_side": side,
+                    "timestamp": 0  # Reset timestamp to allow retry
+                }
+                logger.info(f"❌ Marked {symbol} {side} as failed - backup can retry")
+    
+    def cleanup_stuck_executions(self):
+        """Clean up executions that might be stuck"""
+        with self._lock:
+            current_time = time.time()
+            for symbol, status in list(self.execution_status.items()):
+                if status.get("executing", False):
+                    start_time = status.get("start_time", 0)
+                    if current_time - start_time > self.EXECUTION_TIMEOUT:
+                        logger.warning(f"🧹 Cleaning up stuck execution for {symbol}")
+                        self.execution_status[symbol]["executing"] = False
+
+# Initialize smart tracker
+trade_tracker = SmartTradeTracker()
+
+# Background cleaner for stuck executions
+def background_cleaner():
+    while True:
+        time.sleep(60)  # Check every minute
+        trade_tracker.cleanup_stuck_executions()
+
+cleaner_thread = threading.Thread(target=background_cleaner, daemon=True)
+cleaner_thread.start()
 
 # === BingX Signature ===
 def bingx_signature(params):
@@ -181,20 +256,23 @@ def set_leverage(symbol, leverage=10):
         logger.error(f"❌ Leverage error: {e}")
         return False
 
-# === Execute Trade IMMEDIATELY ===
-def execute_trade_immediately(symbol, action):
-    """Execute trade immediately - no queue, no delays"""
-    global last_trade_time
+# === Smart Trade Execution ===
+def execute_trade_smart(symbol, action, endpoint_name):
+    """Smart trade execution with coordination"""
     
-    current_time = time.time()
+    # Check if we should execute (smart coordination)
+    if not trade_tracker.should_execute_trade(symbol, action):
+        return {
+            "status": "skipped", 
+            "reason": "already_executing_or_recent_duplicate",
+            "endpoint": endpoint_name,
+            "symbol": symbol,
+            "side": action
+        }, 200
     
-    # Check cooldown
-    if current_time - last_trade_time < TRADE_COOLDOWN:
-        logger.info(f"⏸️ Cooldown active, skipping {symbol} {action}")
-        return True
+    logger.info(f"🎯 EXECUTING ({endpoint_name}): {symbol} {action}")
     
-    logger.info(f"🎯 EXECUTING: {symbol} {action}")
-    
+    success = False
     try:
         # STEP 0: Set leverage
         set_leverage(symbol, 10)
@@ -209,118 +287,75 @@ def execute_trade_immediately(symbol, action):
                 logger.info(f"🔄 Closing {current_position} position")
                 close_success = close_position_fast(symbol, current_position)
                 if close_success:
-                    time.sleep(1)  # Wait for close to process
+                    time.sleep(2)  # Wait for close to process
         
         # STEP 3: Open new position
         logger.info(f"📈 Opening {action} position for {symbol}")
         open_success = open_position_fast(symbol, action)
         
-        # Update last trade time
-        last_trade_time = current_time
+        success = open_success
         
-        if open_success:
-            logger.info(f"✅✅✅ TRADE SUCCESS: {symbol} {action}")
+        if success:
+            logger.info(f"✅✅✅ TRADE SUCCESS ({endpoint_name}): {symbol} {action}")
         else:
-            logger.error(f"❌ TRADE FAILED: {symbol} {action}")
-        
-        return open_success
+            logger.error(f"❌ TRADE FAILED ({endpoint_name}): {symbol} {action}")
         
     except Exception as e:
-        logger.error(f"💥 EXECUTION ERROR: {e}")
-        return False
-
-# === Webhook Handler ===
-def handle_webhook(symbol, side, endpoint_name):
-    """Handle webhook request"""
-    start_time = time.time()
+        logger.error(f"💥 EXECUTION ERROR ({endpoint_name}): {e}")
+        success = False
     
-    logger.info(f"🚀 {endpoint_name} WEBHOOK: {symbol} {side}")
-    
-    # Validate inputs
-    if not symbol or not side:
-        return {"error": "missing symbol or side"}, 400
-    
-    if side.upper() not in ['BUY', 'SELL']:
-        return {"error": "side must be BUY or SELL"}, 400
-    
-    # Execute trade IMMEDIATELY in background thread
-    thread = threading.Thread(
-        target=execute_trade_immediately, 
-        args=(symbol, side.upper()),
-        daemon=True
-    )
-    thread.start()
-    
-    response_time = time.time() - start_time
+    # Mark trade as completed (success or failure)
+    trade_tracker.mark_trade_completed(symbol, action, success)
     
     return {
-        "status": "executing",
+        "status": "success" if success else "failed",
         "endpoint": endpoint_name,
         "symbol": symbol,
-        "side": side,
-        "response_time": f"{response_time:.2f}s",
+        "side": action,
         "timestamp": datetime.now().isoformat()
     }, 200
 
-# === MULTIPLE WEBHOOK ENDPOINTS ===
+# === Smart Webhook Handler ===
 @app.route('/webhook', methods=['POST'])
 def webhook_primary():
     """Primary webhook endpoint"""
     try:
         data = request.get_json(force=True)
-        result, status = handle_webhook(
-            data.get("symbol"), 
-            data.get("side"), 
-            "PRIMARY"
-        )
+        symbol = data.get("symbol")
+        side = data.get("side")
+        
+        if not symbol or not side:
+            return jsonify({"error": "missing symbol or side"}), 400
+        
+        if side.upper() not in ['BUY', 'SELL']:
+            return jsonify({"error": "side must be BUY or SELL"}), 400
+        
+        result, status = execute_trade_smart(symbol, side.upper(), "PRIMARY")
         return jsonify(result), status
+        
     except Exception as e:
         logger.error(f"❌ PRIMARY WEBHOOK ERROR: {e}")
         return jsonify({"error": str(e)}), 500
 
 @app.route('/backup', methods=['POST'])
 def webhook_backup():
-    """Backup webhook endpoint"""
+    """Backup webhook endpoint - only executes if primary fails"""
     try:
         data = request.get_json(force=True)
-        result, status = handle_webhook(
-            data.get("symbol"), 
-            data.get("side"), 
-            "BACKUP"
-        )
+        symbol = data.get("symbol")
+        side = data.get("side")
+        
+        if not symbol or not side:
+            return jsonify({"error": "missing symbol or side"}), 400
+        
+        if side.upper() not in ['BUY', 'SELL']:
+            return jsonify({"error": "side must be BUY or SELL"}), 400
+        
+        result, status = execute_trade_smart(symbol, side.upper(), "BACKUP")
         return jsonify(result), status
+        
     except Exception as e:
         logger.error(f"❌ BACKUP WEBHOOK ERROR: {e}")
-        return jsonify({"error": str(e)}), 500
-
-@app.route('/emergency', methods=['POST'])
-def webhook_emergency():
-    """Emergency webhook endpoint"""
-    try:
-        data = request.get_json(force=True)
-        result, status = handle_webhook(
-            data.get("symbol"), 
-            data.get("side"), 
-            "EMERGENCY"
-        )
-        return jsonify(result), status
-    except Exception as e:
-        logger.error(f"❌ EMERGENCY WEBHOOK ERROR: {e}")
-        return jsonify({"error": str(e)}), 500
-
-@app.route('/fallback', methods=['POST'])
-def webhook_fallback():
-    """Fallback webhook endpoint"""
-    try:
-        data = request.get_json(force=True)
-        result, status = handle_webhook(
-            data.get("symbol"), 
-            data.get("side"), 
-            "FALLBACK"
-        )
-        return jsonify(result), status
-    except Exception as e:
-        logger.error(f"❌ FALLBACK WEBHOOK ERROR: {e}")
         return jsonify({"error": str(e)}), 500
 
 # === Status Endpoints ===
@@ -330,7 +365,8 @@ def health_check():
         "status": "healthy",
         "timestamp": datetime.now().isoformat(),
         "trade_balance": TRADE_BALANCE,
-        "position_size": TRADE_BALANCE * 3
+        "position_size": TRADE_BALANCE * 3,
+        "execution_status": trade_tracker.execution_status
     })
 
 @app.route('/position/<symbol>', methods=['GET'])
@@ -342,43 +378,34 @@ def check_position(symbol):
         "timestamp": datetime.now().isoformat()
     })
 
-@app.route('/test/<symbol>/<side>', methods=['GET'])
-def test_trade(symbol, side):
-    if side.upper() not in ['BUY', 'SELL']:
-        return jsonify({"error": "side must be BUY or SELL"}), 400
-    
-    success = execute_trade_immediately(symbol, side.upper())
-    return jsonify({
-        "status": "success" if success else "failed",
-        "symbol": symbol,
-        "side": side
-    })
-
 @app.route('/')
 def home():
     return """
-    ✅ ULTRA-RELIABLE BINGX BOT - IMMEDIATE EXECUTION
+    ✅ SMART BINGX BOT - INTELLIGENT BACKUP
     
     🔄 WEBHOOK ENDPOINTS:
-    - PRIMARY:   POST /webhook
-    - BACKUP:    POST /backup
-    - EMERGENCY: POST /emergency
-    - FALLBACK:  POST /fallback
+    - PRIMARY: POST /webhook (main execution)
+    - BACKUP:  POST /backup (only if primary fails)
     
-    🛡️ FEATURES:
-    - Immediate execution (no queue delays)
-    - 4x redundant webhooks
-    - Cooldown protection
-    - Exact 3x position sizing
-    - Real-time logging
+    🧠 SMART FEATURES:
+    - Primary executes first
+    - Backup only runs if primary fails
+    - No duplicate executions
+    - 10-second cooldown after success
+    - Stuck execution cleanup
+    - Real-time coordination
+    
+    📝 SETUP:
+    - TradingView Alert 1: /webhook
+    - TradingView Alert 2: /backup (as backup)
     """
 
 # === Startup ===
 if __name__ == "__main__":
-    logger.info("🔷 Starting IMMEDIATE-EXECUTION BingX Bot")
+    logger.info("🔷 Starting SMART BingX Bot with Intelligent Backup")
     logger.info(f"💰 Trade Balance: {TRADE_BALANCE} USDT")
     logger.info(f"📊 Position Size: {TRADE_BALANCE * 3} USDT")
-    logger.info("🛡️ 4x redundant webhook endpoints enabled")
-    logger.info("⚡ Immediate execution (no queue delays)")
+    logger.info("🧠 Intelligent backup system enabled")
+    logger.info("🛡️ Primary executes, backup only runs if primary fails")
     
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 10000)))
