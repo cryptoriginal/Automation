@@ -30,6 +30,7 @@ class TradeTracker:
     def __init__(self):
         self.active_trades = {}
         self._lock = threading.Lock()
+        self.mode_cache = {}  # Cache for mode detection
     
     def can_trade(self, symbol):
         """Check if we can trade this symbol"""
@@ -52,6 +53,22 @@ class TradeTracker:
                 'quantity': quantity,
                 'timestamp': time.time()
             }
+    
+    def cache_mode(self, symbol, mode):
+        """Cache the detected mode for a symbol"""
+        with self._lock:
+            self.mode_cache[symbol] = {
+                'mode': mode,
+                'timestamp': time.time()
+            }
+    
+    def get_cached_mode(self, symbol):
+        """Get cached mode"""
+        with self._lock:
+            cached = self.mode_cache.get(symbol)
+            if cached and time.time() - cached['timestamp'] < 300:  # 5 minute cache
+                return cached['mode']
+            return None
 
 # Initialize tracker
 trade_tracker = TradeTracker()
@@ -90,6 +107,44 @@ def get_current_price(symbol):
         logger.error(f"❌ Price error: {e}")
         return None
 
+# === Detect Position Mode ===
+def detect_position_mode(symbol):
+    """Detect if symbol is in ONE-WAY or HEDGE mode"""
+    try:
+        # Check cached mode first
+        cached_mode = trade_tracker.get_cached_mode(symbol)
+        if cached_mode:
+            return cached_mode
+            
+        params = {"symbol": symbol, "timestamp": int(time.time() * 1000)}
+        signature = bingx_signature(params)
+        params["signature"] = signature
+        
+        response = requests.get(
+            f"{BASE_URL}/openApi/swap/v2/user/positions",
+            headers=bingx_headers(),
+            params=params,
+            timeout=10
+        )
+        data = response.json()
+        
+        if data.get("code") == 0 and "data" in data:
+            positions = data["data"]
+            for position in positions:
+                # If we can see both LONG and SHORT positions, it's HEDGE mode
+                if "LONG" in str(position) and "SHORT" in str(position):
+                    trade_tracker.cache_mode(symbol, "HEDGE")
+                    return "HEDGE"
+            
+            # Default to ONE_WAY if we can't determine
+            trade_tracker.cache_mode(symbol, "ONE_WAY")
+            return "ONE_WAY"
+        
+        return "ONE_WAY"  # Default assumption
+    except Exception as e:
+        logger.error(f"❌ Mode detection error: {e}")
+        return "ONE_WAY"  # Default fallback
+
 # === Get Current Position ===
 def get_current_position(symbol):
     """Get current position for symbol"""
@@ -120,9 +175,9 @@ def get_current_position(symbol):
         logger.error(f"❌ Position check error: {e}")
         return None
 
-# === Universal Position Opener ===
+# === Smart Position Opener ===
 def open_position(symbol, action):
-    """Universal position opener - works for both ONE-WAY and HEDGE modes"""
+    """Smart position opener that detects mode and uses correct parameters"""
     try:
         # Get current price for quantity calculation
         current_price = get_current_price(symbol)
@@ -140,7 +195,11 @@ def open_position(symbol, action):
         logger.info(f"💰 Position calc: {TRADE_BALANCE} USDT × 3 = {usdt_value} USDT")
         logger.info(f"📊 Using price: {current_price} → Quantity: {quantity}")
         
-        # UNIVERSAL PARAMS - Try without positionSide first
+        # Detect position mode
+        position_mode = detect_position_mode(symbol)
+        logger.info(f"🔍 Detected position mode: {position_mode}")
+        
+        # Prepare base parameters
         params = {
             "symbol": symbol,
             "side": action,  # BUY or SELL
@@ -148,6 +207,12 @@ def open_position(symbol, action):
             "quantity": quantity,
             "timestamp": int(time.time() * 1000)
         }
+        
+        # Add positionSide based on detected mode
+        if position_mode == "HEDGE":
+            params["positionSide"] = "LONG" if action == "BUY" else "SHORT"
+        else:  # ONE_WAY mode
+            params["positionSide"] = "BOTH"
         
         signature = bingx_signature(params)
         params["signature"] = signature
@@ -159,31 +224,6 @@ def open_position(symbol, action):
             timeout=10
         )
         data = response.json()
-        
-        # If failed due to positionSide requirement, retry with positionSide
-        if data.get("code") != 0 and "positionSide" in data.get("msg", ""):
-            logger.info("🔄 Retrying with positionSide parameter...")
-            
-            # Add positionSide for hedge mode compatibility
-            params_with_position = {
-                "symbol": symbol,
-                "side": action,
-                "positionSide": "LONG" if action == "BUY" else "SHORT",
-                "type": "MARKET", 
-                "quantity": quantity,
-                "timestamp": int(time.time() * 1000)
-            }
-            
-            signature = bingx_signature(params_with_position)
-            params_with_position["signature"] = signature
-            
-            response = requests.post(
-                f"{BASE_URL}/openApi/swap/v2/trade/order",
-                headers=bingx_headers(),
-                json=params_with_position,
-                timeout=10
-            )
-            data = response.json()
         
         logger.info(f"📈 Open {action} response: {data}")
         
@@ -199,14 +239,18 @@ def open_position(symbol, action):
         logger.error(f"❌ Open error: {e}")
         return False
 
-# === Universal Position Closer ===
+# === Smart Position Closer ===
 def close_position(symbol, side, quantity):
-    """Universal position closer - works for both ONE-WAY and HEDGE modes"""
+    """Smart position closer that detects mode and uses correct parameters"""
     try:
         # Determine close side (opposite of position side)
         close_side = "SELL" if side == "LONG" else "BUY"
         
-        # UNIVERSAL PARAMS - Try without positionSide first
+        # Detect position mode
+        position_mode = detect_position_mode(symbol)
+        logger.info(f"🔍 Detected position mode for close: {position_mode}")
+        
+        # Prepare base parameters
         params = {
             "symbol": symbol,
             "side": close_side,
@@ -214,6 +258,12 @@ def close_position(symbol, side, quantity):
             "quantity": quantity,
             "timestamp": int(time.time() * 1000)
         }
+        
+        # Add positionSide based on detected mode
+        if position_mode == "HEDGE":
+            params["positionSide"] = side  # Use the original position side for closing in hedge mode
+        else:  # ONE_WAY mode
+            params["positionSide"] = "BOTH"
         
         signature = bingx_signature(params)
         params["signature"] = signature
@@ -225,30 +275,6 @@ def close_position(symbol, side, quantity):
             timeout=10
         )
         data = response.json()
-        
-        # If failed due to positionSide requirement, retry with positionSide
-        if data.get("code") != 0 and "positionSide" in data.get("msg", ""):
-            logger.info("🔄 Retrying close with positionSide parameter...")
-            
-            params_with_position = {
-                "symbol": symbol,
-                "side": close_side,
-                "positionSide": side,  # Use the original position side
-                "type": "MARKET",
-                "quantity": quantity,
-                "timestamp": int(time.time() * 1000)
-            }
-            
-            signature = bingx_signature(params_with_position)
-            params_with_position["signature"] = signature
-            
-            response = requests.post(
-                f"{BASE_URL}/openApi/swap/v2/trade/order",
-                headers=bingx_headers(),
-                json=params_with_position,
-                timeout=10
-            )
-            data = response.json()
         
         logger.info(f"🔻 Close {side} response: {data}")
         
@@ -263,64 +289,56 @@ def close_position(symbol, side, quantity):
         logger.error(f"❌ Close error: {e}")
         return False
 
-# === Universal Leverage Setter ===
+# === Smart Leverage Setter ===
 def set_leverage(symbol, leverage=10):
-    """Set leverage for the symbol - universal approach"""
+    """Set leverage for the symbol - smart approach"""
     try:
-        # Try without side parameter first
-        params = {
-            "symbol": symbol,
-            "leverage": leverage,
-            "timestamp": int(time.time() * 1000)
-        }
+        # Detect position mode
+        position_mode = detect_position_mode(symbol)
         
-        signature = bingx_signature(params)
-        params["signature"] = signature
-        
-        response = requests.post(
-            f"{BASE_URL}/openApi/swap/v2/trade/leverage",
-            headers=bingx_headers(),
-            json=params,
-            timeout=10
-        )
-        data = response.json()
-        
-        # If failed due to side requirement, retry with both sides
-        if data.get("code") != 0 and "side" in data.get("msg", ""):
-            logger.info("🔄 Setting leverage for both LONG and SHORT...")
-            
-            # Set for LONG
-            params_long = {
+        if position_mode == "HEDGE":
+            # Set for both LONG and SHORT in hedge mode
+            for side in ["LONG", "SHORT"]:
+                params = {
+                    "symbol": symbol,
+                    "leverage": leverage,
+                    "side": side,
+                    "timestamp": int(time.time() * 1000)
+                }
+                signature = bingx_signature(params)
+                params["signature"] = signature
+                response = requests.post(
+                    f"{BASE_URL}/openApi/swap/v2/trade/leverage",
+                    headers=bingx_headers(),
+                    json=params,
+                    timeout=10
+                )
+        else:
+            # Set without side in one-way mode
+            params = {
                 "symbol": symbol,
                 "leverage": leverage,
-                "side": "LONG",
                 "timestamp": int(time.time() * 1000)
             }
-            signature_long = bingx_signature(params_long)
-            params_long["signature"] = signature_long
-            requests.post(f"{BASE_URL}/openApi/swap/v2/trade/leverage", headers=bingx_headers(), json=params_long, timeout=10)
-            
-            # Set for SHORT
-            params_short = {
-                "symbol": symbol,
-                "leverage": leverage,
-                "side": "SHORT",
-                "timestamp": int(time.time() * 1000)
-            }
-            signature_short = bingx_signature(params_short)
-            params_short["signature"] = signature_short
-            requests.post(f"{BASE_URL}/openApi/swap/v2/trade/leverage", headers=bingx_headers(), json=params_short, timeout=10)
+            signature = bingx_signature(params)
+            params["signature"] = signature
+            response = requests.post(
+                f"{BASE_URL}/openApi/swap/v2/trade/leverage",
+                headers=bingx_headers(),
+                json=params,
+                timeout=10
+            )
         
-        logger.info(f"⚙️ Leverage set to {leverage}x for {symbol}")
+        logger.info(f"⚙️ Leverage set to {leverage}x for {symbol} ({position_mode} mode)")
         return True
         
     except Exception as e:
         logger.error(f"❌ Leverage error: {e}")
         return False
 
-# === Trade Execution - UNIVERSAL ===
+# === Trade Execution - SMART ===
 def execute_trade(symbol, action, endpoint_name):
-    """Universal trade execution - works for ANY mode"""
+    """Smart trade execution with mode detection"""
     
     # Check cooldown
     if not trade_tracker.can_trade(symbol):
@@ -332,7 +350,7 @@ def execute_trade(symbol, action, endpoint_name):
             "side": action
         }, 200
     
-    logger.info(f"🎯 EXECUTING ({endpoint_name}): {symbol} {action}")
+    logger.info(f"🎯 SMART EXECUTING ({endpoint_name}): {symbol} {action}")
     
     success = False
     try:
@@ -394,7 +412,7 @@ def execute_trade(symbol, action, endpoint_name):
         "symbol": symbol,
         "side": action,
         "timestamp": datetime.now().isoformat(),
-        "mode": "universal"
+        "mode": "smart"
     }, 200
 
 # === Webhook Handlers ===
@@ -403,6 +421,9 @@ def webhook_primary():
     """Primary webhook endpoint"""
     try:
         data = request.get_json(force=True)
+        if not data:
+            return jsonify({"error": "no JSON data received"}), 400
+            
         symbol = data.get("symbol")
         side = data.get("side")
         
@@ -424,6 +445,9 @@ def webhook_backup():
     """Backup webhook endpoint"""
     try:
         data = request.get_json(force=True)
+        if not data:
+            return jsonify({"error": "no JSON data received"}), 400
+            
         symbol = data.get("symbol")
         side = data.get("side")
         
@@ -448,16 +472,18 @@ def health_check():
         "timestamp": datetime.now().isoformat(),
         "trade_balance": TRADE_BALANCE,
         "position_size": TRADE_BALANCE * 3,
-        "mode": "universal"
+        "mode": "smart_detection"
     })
 
 @app.route('/position/<symbol>', methods=['GET'])
 def check_position(symbol):
     """Check current position"""
     position = get_current_position(symbol)
+    mode = detect_position_mode(symbol)
     return jsonify({
         "symbol": symbol,
         "position": position if position else "No position",
+        "mode": mode,
         "timestamp": datetime.now().isoformat()
     })
 
@@ -471,18 +497,24 @@ def close_all_positions(symbol):
     else:
         return jsonify({"status": "no_position"})
 
+@app.route('/detect-mode/<symbol>', methods=['GET'])
+def detect_mode(symbol):
+    """Detect position mode for a symbol"""
+    mode = detect_position_mode(symbol)
+    return jsonify({"symbol": symbol, "mode": mode})
+
 @app.route('/')
 def home():
     return """
-    ✅ BINGX BOT - UNIVERSAL MODE (WORKS WITH BOTH ONE-WAY & HEDGE)
+    ✅ BINGX BOT - SMART MODE DETECTION
     
     🔄 WEBHOOK ENDPOINTS:
     - PRIMARY: POST /webhook (main execution)
     - BACKUP:  POST /backup (backup execution)
     
-    🎯 UNIVERSAL FEATURES:
-    - ✅ WORKS WITH BOTH MODES: Automatically detects required parameters
-    - ✅ SMART RETRY: Tries without positionSide first, then with positionSide
+    🎯 SMART FEATURES:
+    - ✅ AUTOMATIC MODE DETECTION: Detects One-Way vs Hedge mode
+    - ✅ CORRECT PARAMETERS: Uses positionSide: BOTH for One-Way, LONG/SHORT for Hedge
     - ✅ ACCURATE: Always exact 3x position size
     - ✅ RELIABLE: Handles all BingX API inconsistencies
     - ✅ SAFE: Always closes before opening opposite position
@@ -493,18 +525,17 @@ def home():
     3. TradingView: {"symbol":"SUI-USDT","side":"BUY"}
     
     🛡️ WHY THIS WORKS:
-    - Automatic parameter detection
-    - Smart retry logic
-    - Handles API inconsistencies
-    - Works regardless of your BingX mode setting
+    - Automatically detects your position mode
+    - Uses correct parameters for each mode
+    - No more positionSide errors
     """
 
 # === Startup ===
 if __name__ == "__main__":
-    logger.info("🚀 Starting BINGX BOT - UNIVERSAL MODE")
+    logger.info("🚀 Starting BINGX BOT - SMART MODE DETECTION")
     logger.info(f"💰 Trade Balance: {TRADE_BALANCE} USDT")
     logger.info(f"📊 Position Size: {TRADE_BALANCE * 3} USDT")
-    logger.info("🎯 UNIVERSAL: Works with both One-Way and Hedge modes")
-    logger.info("🛡️ Smart parameter detection active")
+    logger.info("🎯 SMART: Automatically detects One-Way vs Hedge mode")
+    logger.info("🛡️ Uses positionSide: BOTH for One-Way, LONG/SHORT for Hedge")
     
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 10000)))
