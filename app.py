@@ -25,67 +25,23 @@ TRADE_BALANCE = float(os.getenv("TRADE_BALANCE_USDT", "50"))
 
 BASE_URL = "https://open-api.bingx.com"
 
-# Trade tracking - ENHANCED DUPLICATION PROTECTION
+# Simple trade tracking
 class TradeTracker:
     def __init__(self):
-        self.active_trades = {}
+        self.last_trade_time = {}
         self._lock = threading.Lock()
-        self.mode_cache = {}
-        self.last_signal = {}  # Track last signal to prevent duplicates
     
-    def can_trade(self, symbol, side):
-        """Enhanced: Check if we can trade this symbol with this side"""
+    def can_trade(self, symbol):
+        """Simple cooldown check"""
         with self._lock:
             current_time = time.time()
+            last_time = self.last_trade_time.get(symbol, 0)
             
-            # Check if same signal was recently processed
-            last_signal = self.last_signal.get(symbol, {})
-            if (last_signal.get('side') == side and 
-                current_time - last_signal.get('timestamp', 0) < 30):  # 30 second signal cooldown
-                logger.info(f"⏸️ Recent {side} signal for {symbol}, skipping duplicate")
+            if current_time - last_time < 10:  # 10 second cooldown
                 return False
             
-            # Check if trade was executed recently (regardless of side)
-            trade_info = self.active_trades.get(symbol, {})
-            last_trade_time = trade_info.get('timestamp', 0)
-            if current_time - last_trade_time < 15:  # 15 second trade cooldown
-                logger.info(f"⏸️ Recent trade for {symbol}, skipping")
-                return False
-            
+            self.last_trade_time[symbol] = current_time
             return True
-    
-    def mark_signal(self, symbol, side):
-        """Mark signal as received"""
-        with self._lock:
-            self.last_signal[symbol] = {
-                'side': side,
-                'timestamp': time.time()
-            }
-    
-    def mark_trade(self, symbol, side, quantity):
-        """Mark trade as executed"""
-        with self._lock:
-            self.active_trades[symbol] = {
-                'side': side,
-                'quantity': quantity,
-                'timestamp': time.time()
-            }
-    
-    def cache_mode(self, symbol, mode):
-        """Cache the detected mode for a symbol"""
-        with self._lock:
-            self.mode_cache[symbol] = {
-                'mode': mode,
-                'timestamp': time.time()
-            }
-    
-    def get_cached_mode(self, symbol):
-        """Get cached mode"""
-        with self._lock:
-            cached = self.mode_cache.get(symbol)
-            if cached and time.time() - cached['timestamp'] < 300:
-                return cached['mode']
-            return None
 
 # Initialize tracker
 trade_tracker = TradeTracker()
@@ -124,41 +80,6 @@ def get_current_price(symbol):
         logger.error(f"❌ Price error: {e}")
         return None
 
-# === Detect Position Mode ===
-def detect_position_mode(symbol):
-    """Detect if symbol is in ONE-WAY or HEDGE mode"""
-    try:
-        cached_mode = trade_tracker.get_cached_mode(symbol)
-        if cached_mode:
-            return cached_mode
-            
-        params = {"symbol": symbol, "timestamp": int(time.time() * 1000)}
-        signature = bingx_signature(params)
-        params["signature"] = signature
-        
-        response = requests.get(
-            f"{BASE_URL}/openApi/swap/v2/user/positions",
-            headers=bingx_headers(),
-            params=params,
-            timeout=10
-        )
-        data = response.json()
-        
-        if data.get("code") == 0 and "data" in data:
-            positions = data["data"]
-            for position in positions:
-                if "LONG" in str(position) and "SHORT" in str(position):
-                    trade_tracker.cache_mode(symbol, "HEDGE")
-                    return "HEDGE"
-            
-            trade_tracker.cache_mode(symbol, "ONE_WAY")
-            return "ONE_WAY"
-        
-        return "ONE_WAY"
-    except Exception as e:
-        logger.error(f"❌ Mode detection error: {e}")
-        return "ONE_WAY"
-
 # === Get Current Position ===
 def get_current_position(symbol):
     """Get current position for symbol"""
@@ -189,15 +110,17 @@ def get_current_position(symbol):
         logger.error(f"❌ Position check error: {e}")
         return None
 
-# === Smart Position Opener ===
+# === Open Position - SIMPLE & PROVEN ===
 def open_position(symbol, action):
-    """Smart position opener that detects mode and uses correct parameters"""
+    """Open position - SIMPLE version that works"""
     try:
+        # Get current price for quantity calculation
         current_price = get_current_price(symbol)
         if not current_price:
             logger.error(f"❌ Cannot get current price for {symbol}")
             return False
         
+        # Calculate exact 3x position size
         usdt_value = TRADE_BALANCE * 3
         quantity = usdt_value / current_price
         quantity = round(quantity, 4)
@@ -205,21 +128,15 @@ def open_position(symbol, action):
         logger.info(f"💰 Position calc: {TRADE_BALANCE} USDT × 3 = {usdt_value} USDT")
         logger.info(f"📊 Using price: {current_price} → Quantity: {quantity}")
         
-        position_mode = detect_position_mode(symbol)
-        logger.info(f"🔍 Detected position mode: {position_mode}")
-        
+        # SIMPLE PARAMS - Use positionSide: BOTH for One-Way mode
         params = {
             "symbol": symbol,
-            "side": action,
+            "side": action,  # BUY or SELL
+            "positionSide": "BOTH",  # For One-Way mode
             "type": "MARKET",
             "quantity": quantity,
             "timestamp": int(time.time() * 1000)
         }
-        
-        if position_mode == "HEDGE":
-            params["positionSide"] = "LONG" if action == "BUY" else "SHORT"
-        else:
-            params["positionSide"] = "BOTH"
         
         signature = bingx_signature(params)
         params["signature"] = signature
@@ -236,7 +153,6 @@ def open_position(symbol, action):
         
         if data.get("code") == 0:
             logger.info(f"✅ Position open successful: {symbol} {action}")
-            trade_tracker.mark_trade(symbol, action, quantity)
             return True
         else:
             logger.error(f"❌ Open failed: {data.get('msg')}")
@@ -246,27 +162,22 @@ def open_position(symbol, action):
         logger.error(f"❌ Open error: {e}")
         return False
 
-# === Smart Position Closer ===
+# === Close Position - SIMPLE & PROVEN ===
 def close_position(symbol, side, quantity):
-    """Smart position closer that detects mode and uses correct parameters"""
+    """Close position - SIMPLE version that works"""
     try:
+        # Determine close side
         close_side = "SELL" if side == "LONG" else "BUY"
         
-        position_mode = detect_position_mode(symbol)
-        logger.info(f"🔍 Detected position mode for close: {position_mode}")
-        
+        # SIMPLE PARAMS - Use positionSide: BOTH for One-Way mode
         params = {
             "symbol": symbol,
             "side": close_side,
+            "positionSide": "BOTH",  # For One-Way mode
             "type": "MARKET",
             "quantity": quantity,
             "timestamp": int(time.time() * 1000)
         }
-        
-        if position_mode == "HEDGE":
-            params["positionSide"] = side
-        else:
-            params["positionSide"] = "BOTH"
         
         signature = bingx_signature(params)
         params["signature"] = signature
@@ -292,131 +203,103 @@ def close_position(symbol, side, quantity):
         logger.error(f"❌ Close error: {e}")
         return False
 
-# === Smart Leverage Setter ===
+# === Set Leverage - SIMPLE ===
 def set_leverage(symbol, leverage=10):
-    """Set leverage for the symbol - smart approach"""
+    """Set leverage - SIMPLE version"""
     try:
-        position_mode = detect_position_mode(symbol)
+        params = {
+            "symbol": symbol,
+            "leverage": leverage,
+            "timestamp": int(time.time() * 1000)
+        }
         
-        if position_mode == "HEDGE":
-            for side in ["LONG", "SHORT"]:
-                params = {
-                    "symbol": symbol,
-                    "leverage": leverage,
-                    "side": side,
-                    "timestamp": int(time.time() * 1000)
-                }
-                signature = bingx_signature(params)
-                params["signature"] = signature
-                requests.post(
-                    f"{BASE_URL}/openApi/swap/v2/trade/leverage",
-                    headers=bingx_headers(),
-                    json=params,
-                    timeout=10
-                )
-        else:
-            params = {
-                "symbol": symbol,
-                "leverage": leverage,
-                "timestamp": int(time.time() * 1000)
-            }
-            signature = bingx_signature(params)
-            params["signature"] = signature
-            requests.post(
-                f"{BASE_URL}/openApi/swap/v2/trade/leverage",
-                headers=bingx_headers(),
-                json=params,
-                timeout=10
-            )
+        signature = bingx_signature(params)
+        params["signature"] = signature
         
-        logger.info(f"⚙️ Leverage set to {leverage}x for {symbol} ({position_mode} mode)")
+        response = requests.post(
+            f"{BASE_URL}/openApi/swap/v2/trade/leverage",
+            headers=bingx_headers(),
+            json=params,
+            timeout=10
+        )
+        
+        logger.info(f"⚙️ Leverage set to {leverage}x for {symbol}")
         return True
-        
     except Exception as e:
         logger.error(f"❌ Leverage error: {e}")
         return False
 
-# === Trade Execution - ENHANCED DUPLICATION PROTECTION ===
-def execute_trade(symbol, action, endpoint_name):
-    """Enhanced trade execution with better duplication protection"""
+# === Trade Execution - SIMPLE & RELIABLE ===
+def execute_trade(symbol, action):
+    """Simple and reliable trade execution"""
     
-    # Mark signal as received FIRST
-    trade_tracker.mark_signal(symbol, action)
-    
-    # Enhanced duplication check
-    if not trade_tracker.can_trade(symbol, action):
+    # Check cooldown
+    if not trade_tracker.can_trade(symbol):
         return {
             "status": "skipped", 
-            "reason": "cooldown_period_or_duplicate_signal",
-            "endpoint": endpoint_name,
+            "reason": "cooldown_period",
             "symbol": symbol,
             "side": action
         }, 200
     
-    logger.info(f"🎯 EXECUTING ({endpoint_name}): {symbol} {action}")
+    logger.info(f"🎯 EXECUTING: {symbol} {action}")
     
     success = False
     try:
+        # STEP 1: Set leverage
         set_leverage(symbol, 10)
         time.sleep(1)
         
+        # STEP 2: Check current position
         current_position = get_current_position(symbol)
         logger.info(f"📊 Current position: {current_position}")
         
+        # STEP 3: Close existing position if it exists
         if current_position:
             current_side = current_position["side"]
             current_qty = current_position["quantity"]
             
-            need_to_close = False
-            if (action == "BUY" and current_side == "SHORT") or (action == "SELL" and current_side == "LONG"):
-                need_to_close = True
-            elif (action == "BUY" and current_side == "LONG") or (action == "SELL" and current_side == "SHORT"):
-                logger.info(f"ℹ️ Already in {current_side} position, closing first then reopening")
-                need_to_close = True
+            # Always close existing position before opening new one
+            logger.info(f"🔄 Closing existing {current_side} position")
+            close_success = close_position(symbol, current_side, current_qty)
             
-            if need_to_close:
-                logger.info(f"🔄 Closing existing {current_side} position")
-                close_success = close_position(symbol, current_side, current_qty)
-                
-                if close_success:
-                    logger.info("✅ Position closed, waiting for settlement...")
-                    time.sleep(3)
-                else:
-                    logger.error("❌ Failed to close existing position, aborting trade")
-                    return {
-                        "status": "failed",
-                        "reason": "close_position_failed",
-                        "endpoint": endpoint_name,
-                        "symbol": symbol,
-                        "side": action
-                    }, 200
+            if close_success:
+                logger.info("✅ Position closed, waiting for settlement...")
+                time.sleep(3)
+            else:
+                logger.error("❌ Failed to close existing position, aborting trade")
+                return {
+                    "status": "failed",
+                    "reason": "close_position_failed",
+                    "symbol": symbol,
+                    "side": action
+                }, 200
         
+        # STEP 4: Open new position
         logger.info(f"📈 Opening {action} position")
         open_success = open_position(symbol, action)
         success = open_success
         
         if success:
-            logger.info(f"✅✅✅ TRADE SUCCESS ({endpoint_name}): {symbol} {action}")
+            logger.info(f"✅✅✅ TRADE SUCCESS: {symbol} {action}")
         else:
-            logger.error(f"❌ TRADE FAILED ({endpoint_name}): {symbol} {action}")
+            logger.error(f"❌ TRADE FAILED: {symbol} {action}")
         
     except Exception as e:
-        logger.error(f"💥 EXECUTION ERROR ({endpoint_name}): {e}")
+        logger.error(f"💥 EXECUTION ERROR: {e}")
         success = False
     
     return {
         "status": "success" if success else "failed",
-        "endpoint": endpoint_name,
         "symbol": symbol,
         "side": action,
-        "timestamp": datetime.now().isoformat(),
-        "mode": "smart"
+        "timestamp": datetime.now().isoformat()
     }, 200
 
-# === Webhook Handlers ===
+# === SINGLE Webhook Handler ===
 @app.route('/webhook', methods=['POST'])
-def webhook_primary():
-    """Primary webhook endpoint - executes immediately"""
+def webhook():
+    """SINGLE webhook endpoint - no backup needed"""
     try:
         data = request.get_json(force=True)
         if not data:
@@ -431,40 +314,12 @@ def webhook_primary():
         if side.upper() not in ['BUY', 'SELL']:
             return jsonify({"error": "side must be BUY or SELL"}), 400
         
-        logger.info(f"🔔 PRIMARY signal received: {symbol} {side}")
-        result, status = execute_trade(symbol, side.upper(), "PRIMARY")
+        logger.info(f"🔔 SIGNAL RECEIVED: {symbol} {side}")
+        result, status = execute_trade(symbol, side.upper())
         return jsonify(result), status
         
     except Exception as e:
-        logger.error(f"❌ PRIMARY WEBHOOK ERROR: {e}")
-        return jsonify({"error": str(e)}), 500
-
-@app.route('/backup', methods=['POST'])
-def webhook_backup():
-    """Backup webhook endpoint - only executes if PRIMARY fails after delay"""
-    try:
-        data = request.get_json(force=True)
-        if not data:
-            return jsonify({"error": "no JSON data received"}), 400
-            
-        symbol = data.get("symbol")
-        side = data.get("side")
-        
-        if not symbol or not side:
-            return jsonify({"error": "missing symbol or side"}), 400
-        
-        if side.upper() not in ['BUY', 'SELL']:
-            return jsonify({"error": "side must be BUY or SELL"}), 400
-        
-        # Wait 2 seconds to see if primary executes first
-        time.sleep(2)
-        
-        logger.info(f"🛡️ BACKUP signal received: {symbol} {side}")
-        result, status = execute_trade(symbol, side.upper(), "BACKUP")
-        return jsonify(result), status
-        
-    except Exception as e:
-        logger.error(f"❌ BACKUP WEBHOOK ERROR: {e}")
+        logger.error(f"❌ WEBHOOK ERROR: {e}")
         return jsonify({"error": str(e)}), 500
 
 # === Status Endpoints ===
@@ -474,19 +329,16 @@ def health_check():
         "status": "healthy",
         "timestamp": datetime.now().isoformat(),
         "trade_balance": TRADE_BALANCE,
-        "position_size": TRADE_BALANCE * 3,
-        "mode": "smart_detection"
+        "position_size": TRADE_BALANCE * 3
     })
 
 @app.route('/position/<symbol>', methods=['GET'])
 def check_position(symbol):
     """Check current position"""
     position = get_current_position(symbol)
-    mode = detect_position_mode(symbol)
     return jsonify({
         "symbol": symbol,
         "position": position if position else "No position",
-        "mode": mode,
         "timestamp": datetime.now().isoformat()
     })
 
@@ -503,28 +355,33 @@ def close_all_positions(symbol):
 @app.route('/')
 def home():
     return """
-    ✅ BINGX BOT - ENHANCED DUPLICATION PROTECTION
+    ✅ BINGX BOT - SIMPLE & RELIABLE (ONE WEBHOOK)
     
-    🔄 WEBHOOK ENDPOINTS:
-    - PRIMARY: POST /webhook (executes immediately)
-    - BACKUP:  POST /backup (waits 2 seconds, executes only if primary fails)
+    🔄 SINGLE WEBHOOK ENDPOINT:
+    - POST /webhook 
     
-    🛡️ ENHANCED PROTECTION:
-    - ✅ SIGNAL COOLDOWN: 30 seconds for same signal
-    - ✅ TRADE COOLDOWN: 15 seconds between any trades
-    - ✅ BACKUP DELAY: Backup waits 2 seconds before executing
-    - ✅ NO DUPLICATES: Prevents both webhooks from executing same trade
+    🎯 SIMPLE SETUP:
+    1. BingX: ONE-WAY MODE 
+    2. TradingView: ONE alert to /webhook
+    3. JSON: {"symbol":"SUI-USDT","side":"BUY"}
+    
+    ✅ PROVEN FEATURES:
+    - Exact 3x position sizing
+    - Always closes before opening
+    - 10-second cooldown protection
+    - Simple & reliable
     
     ⚡ RECOMMENDATION:
-    - Keep BOTH webhook and backup alerts in TradingView
-    - This ensures no missed signals while preventing duplicates
+    - Use ONLY ONE TradingView alert
+    - This is more reliable than complex backup systems
     """
 
 # === Startup ===
 if __name__ == "__main__":
-    logger.info("🚀 Starting BINGX BOT - ENHANCED DUPLICATION PROTECTION")
+    logger.info("🚀 Starting BINGX BOT - SIMPLE & RELIABLE")
     logger.info(f"💰 Trade Balance: {TRADE_BALANCE} USDT")
     logger.info(f"📊 Position Size: {TRADE_BALANCE * 3} USDT")
-    logger.info("🛡️ Enhanced: 30s signal cooldown, 15s trade cooldown, backup delay")
+    logger.info("🎯 ONE WEBHOOK: Simple and reliable")
+    logger.info("🛡️ 10-second cooldown protection")
     
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 10000)))
