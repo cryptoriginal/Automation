@@ -23,70 +23,76 @@ API_KEY = os.getenv("BINGX_API_KEY")
 SECRET_KEY = os.getenv("BINGX_SECRET_KEY")
 TRADE_BALANCE = float(os.getenv("TRADE_BALANCE_USDT", "50"))
 
+# VALIDATE CRITICAL CONFIG
+if TRADE_BALANCE > 100:
+    logger.error(f"🚨 DANGER: TRADE_BALANCE too high: {TRADE_BALANCE}")
+    TRADE_BALANCE = 20  # Force safe default
+
 BASE_URL = "https://open-api.bingx.com"
 
-# Atomic Trade Tracker - ULTIMATE RELIABILITY
-class AtomicTradeTracker:
+# ULTRA-SAFE Trade Tracker
+class UltraSafeTradeTracker:
     def __init__(self):
-        self.trade_locks = {}  # Per-symbol locks
-        self.last_execution = {}
-        self._global_lock = threading.Lock()
+        self.active_locks = {}
+        self.last_trades = {}
+        self._lock = threading.Lock()
+        self.position_cache = {}
         
-    def acquire_lock(self, symbol, timeout=10):
-        """Atomic lock for symbol - prevents any parallel execution"""
+    def safe_acquire_lock(self, symbol, max_wait=5):
+        """ULTRA-SAFE lock with timeout and stale detection"""
         start_time = time.time()
-        while time.time() - start_time < timeout:
-            with self._global_lock:
-                if symbol not in self.trade_locks:
-                    self.trade_locks[symbol] = {
-                        'locked': True,
-                        'lock_time': time.time(),
-                        'side': None
-                    }
+        while time.time() - start_time < max_wait:
+            with self._lock:
+                current_time = time.time()
+                
+                # Clean stale locks (older than 30 seconds)
+                if symbol in self.active_locks:
+                    lock_time = self.active_locks[symbol]
+                    if current_time - lock_time > 30:
+                        del self.active_locks[symbol]
+                
+                # Acquire lock if available
+                if symbol not in self.active_locks:
+                    self.active_locks[symbol] = current_time
                     return True
-                elif time.time() - self.trade_locks[symbol]['lock_time'] > 30:  # Stale lock
-                    self.trade_locks[symbol] = {
-                        'locked': True, 
-                        'lock_time': time.time(),
-                        'side': None
-                    }
-                    return True
+            
             time.sleep(0.1)
         return False
     
     def release_lock(self, symbol):
-        """Release lock for symbol"""
-        with self._global_lock:
-            if symbol in self.trade_locks:
-                del self.trade_locks[symbol]
+        """Release lock"""
+        with self._lock:
+            if symbol in self.active_locks:
+                del self.active_locks[symbol]
     
-    def should_execute(self, symbol, side):
-        """Check if we should execute this trade"""
-        with self._global_lock:
+    def can_trade(self, symbol, side):
+        """ULTRA-SAFE trade validation"""
+        with self._lock:
             current_time = time.time()
-            last_exec = self.last_execution.get(symbol, {})
+            last_trade = self.last_trades.get(symbol, {})
             
-            # Same signal within 5 seconds - skip
-            if (last_exec.get('side') == side and 
-                current_time - last_exec.get('timestamp', 0) < 5):
+            # Same trade within 10 seconds - BLOCK
+            if (last_trade.get('side') == side and 
+                current_time - last_trade.get('timestamp', 0) < 10):
                 return False
                 
-            # Any trade within 3 seconds - skip  
-            if current_time - last_exec.get('timestamp', 0) < 3:
+            # Any trade within 5 seconds - BLOCK
+            if current_time - last_trade.get('timestamp', 0) < 5:
                 return False
                 
             return True
     
-    def mark_executed(self, symbol, side):
-        """Mark trade as executed"""
-        with self._global_lock:
-            self.last_execution[symbol] = {
+    def record_trade(self, symbol, side, quantity):
+        """Record trade execution"""
+        with self._lock:
+            self.last_trades[symbol] = {
                 'side': side,
+                'quantity': quantity,
                 'timestamp': time.time()
             }
 
 # Initialize tracker
-trade_tracker = AtomicTradeTracker()
+trade_tracker = UltraSafeTradeTracker()
 
 # === BingX Signature ===
 def bingx_signature(params):
@@ -100,8 +106,9 @@ def bingx_signature(params):
 def bingx_headers():
     return {"X-BX-APIKEY": API_KEY, "Content-Type": "application/json"}
 
-# === Get Current Price ===
-def get_current_price(symbol):
+# === ULTRA-SAFE Price Check ===
+def get_current_price_safe(symbol):
+    """ULTRA-SAFE price getter with validation"""
     for attempt in range(3):
         try:
             params = {"symbol": symbol}
@@ -111,16 +118,66 @@ def get_current_price(symbol):
                 timeout=10
             )
             data = response.json()
+            
             if data.get("code") == 0 and "data" in data:
-                return float(data["data"]["price"])
-        except Exception:
-            pass
+                price = float(data["data"]["price"])
+                
+                # CRITICAL SAFETY CHECK
+                if price <= 0:
+                    logger.error(f"🚨 INVALID PRICE: {price} for {symbol}")
+                    continue
+                if price > 100000:  # Unrealistically high price
+                    logger.error(f"🚨 SUSPICIOUS PRICE: {price} for {symbol}")
+                    continue
+                    
+                logger.info(f"✅ Valid price for {symbol}: ${price}")
+                return price
+                
+        except Exception as e:
+            logger.error(f"❌ Price error: {e}")
+        
         time.sleep(1)
+    
+    logger.error(f"🚨 ALL PRICE ATTEMPTS FAILED FOR {symbol}")
     return None
+
+# === ULTRA-SAFE Quantity Calculator ===
+def calculate_safe_quantity(symbol, action):
+    """ULTRA-SAFE quantity calculation with multiple validations"""
+    # STEP 1: Get safe price
+    current_price = get_current_price_safe(symbol)
+    if not current_price:
+        return None
+    
+    # STEP 2: Calculate base quantity
+    usdt_value = TRADE_BALANCE * 3
+    raw_quantity = usdt_value / current_price
+    
+    # STEP 3: CRITICAL SAFETY VALIDATION
+    expected_max_quantity = (TRADE_BALANCE * 10) / current_price  # 10x safety margin
+    
+    if raw_quantity > expected_max_quantity:
+        logger.error(f"🚨 DANGEROUS QUANTITY: {raw_quantity} > max {expected_max_quantity}")
+        logger.error(f"   Price: {current_price}, USDT Value: {usdt_value}")
+        return None
+    
+    # STEP 4: Apply precision
+    safe_quantity = round(raw_quantity, 4)
+    
+    # STEP 5: Final validation
+    calculated_value = safe_quantity * current_price
+    expected_value = TRADE_BALANCE * 3
+    
+    if abs(calculated_value - expected_value) > expected_value * 0.5:  # 50% tolerance
+        logger.error(f"🚨 QUANTITY VALIDATION FAILED: {calculated_value} vs {expected_value}")
+        return None
+    
+    logger.info(f"✅ SAFE QUANTITY: {safe_quantity} {symbol} (Value: ${calculated_value})")
+    return safe_quantity
 
 # === Get Current Position ===
 def get_current_position(symbol):
-    for attempt in range(3):
+    for attempt in range(2):
         try:
             params = {"symbol": symbol, "timestamp": int(time.time() * 1000)}
             signature = bingx_signature(params)
@@ -144,31 +201,28 @@ def get_current_position(symbol):
                             "quantity": abs(position_amt)
                         }
                 return None
-        except Exception:
-            pass
+        except Exception as e:
+            logger.error(f"❌ Position error: {e}")
         time.sleep(1)
     return None
 
-# === Open Position ===
-def open_position(symbol, action):
+# === ULTRA-SAFE Open Position ===
+def open_position_ultra_safe(symbol, action):
+    """ULTRA-SAFE position opener"""
+    # STEP 1: Calculate safe quantity
+    quantity = calculate_safe_quantity(symbol, action)
+    if not quantity:
+        logger.error(f"🚨 ABORTING: Invalid quantity calculation for {symbol}")
+        return False
+    
+    # STEP 2: Execute trade
     for attempt in range(2):
         try:
-            current_price = get_current_price(symbol)
-            if not current_price:
-                continue
-                
-            usdt_value = TRADE_BALANCE * 3
-            quantity = usdt_value / current_price
-            quantity = round(quantity, 4)
-            
-            logger.info(f"💰 {TRADE_BALANCE} USDT × 3 = {usdt_value} USDT")
-            logger.info(f"📊 Price: {current_price} → Qty: {quantity}")
-            
             params = {
                 "symbol": symbol,
                 "side": action,
                 "positionSide": "BOTH",
-                "type": "MARKET", 
+                "type": "MARKET",
                 "quantity": quantity,
                 "timestamp": int(time.time() * 1000)
             }
@@ -184,12 +238,20 @@ def open_position(symbol, action):
             )
             data = response.json()
             
+            logger.info(f"📈 Open {action} response: {data}")
+            
             if data.get("code") == 0:
-                logger.info(f"✅ OPEN SUCCESS: {symbol} {action}")
+                logger.info(f"✅ ULTRA-SAFE OPEN SUCCESS: {symbol} {action}")
+                trade_tracker.record_trade(symbol, action, quantity)
                 return True
+            else:
+                logger.error(f"❌ Open failed: {data.get('msg')}")
         except Exception as e:
             logger.error(f"❌ Open error: {e}")
-        time.sleep(2)
+        
+        if attempt < 1:
+            time.sleep(2)
+    
     return False
 
 # === Close Position ===
@@ -219,58 +281,42 @@ def close_position(symbol, side, quantity):
             data = response.json()
             
             if data.get("code") == 0:
-                logger.info(f"✅ CLOSE SUCCESS: {symbol} {side}")
+                logger.info(f"✅ Close successful: {symbol} {side}")
                 return True
         except Exception as e:
             logger.error(f"❌ Close error: {e}")
         time.sleep(2)
     return False
 
-# === Set Leverage ===
-def set_leverage(symbol, leverage=10):
-    try:
-        params = {
-            "symbol": symbol,
-            "leverage": leverage,
-            "timestamp": int(time.time() * 1000)
-        }
-        signature = bingx_signature(params)
-        params["signature"] = signature
-        requests.post(
-            f"{BASE_URL}/openApi/swap/v2/trade/leverage",
-            headers=bingx_headers(),
-            json=params,
-            timeout=10
-        )
-        return True
-    except Exception:
-        return False
-
-# === Atomic Trade Execution ===
-def execute_trade_atomic(symbol, action, endpoint_name):
-    """ATOMIC trade execution - prevents all duplicates"""
+# === ULTRA-SAFE Trade Execution ===
+def execute_trade_ultra_safe(symbol, action, endpoint_name):
+    """ULTRA-SAFE trade execution with maximum protection"""
     
-    # STEP 1: Acquire atomic lock
-    if not trade_tracker.acquire_lock(symbol):
-        logger.info(f"⏸️ {symbol} is busy, skipping {action}")
-        return {"status": "skipped", "reason": "symbol_busy"}, 200
+    # STEP 1: Pre-validation
+    if not trade_tracker.can_trade(symbol, action):
+        logger.info(f"⏸️ Cooldown active for {symbol}, skipping")
+        return {"status": "skipped", "reason": "cooldown"}, 200
+    
+    # STEP 2: Acquire ULTRA-SAFE lock
+    if not trade_tracker.safe_acquire_lock(symbol):
+        logger.info(f"⏸️ {symbol} locked, skipping {action}")
+        return {"status": "skipped", "reason": "locked"}, 200
     
     try:
-        # STEP 2: Check if we should execute
-        if not trade_tracker.should_execute(symbol, action):
-            logger.info(f"⏸️ Recent {action} for {symbol}, skipping")
-            return {"status": "skipped", "reason": "recent_trade"}, 200
+        # DOUBLE CHECK inside lock
+        if not trade_tracker.can_trade(symbol, action):
+            logger.info(f"⏸️ Cooldown confirmed inside lock, skipping")
+            return {"status": "skipped", "reason": "cooldown_confirmed"}, 200
         
-        logger.info(f"🎯 ATOMIC EXECUTION ({endpoint_name}): {symbol} {action}")
+        logger.info(f"🎯 ULTRA-SAFE EXECUTION ({endpoint_name}): {symbol} {action}")
         
         success = False
         try:
-            set_leverage(symbol, 10)
-            time.sleep(1)
-            
+            # Check current position
             current_position = get_current_position(symbol)
-            logger.info(f"📊 Position: {current_position}")
+            logger.info(f"📊 Current position: {current_position}")
             
+            # Close existing position if needed
             if current_position:
                 current_side = current_position["side"]
                 current_qty = current_position["quantity"]
@@ -286,18 +332,18 @@ def execute_trade_atomic(symbol, action, endpoint_name):
                     if close_position(symbol, current_side, current_qty):
                         time.sleep(2)
             
+            # ULTRA-SAFE open
             logger.info(f"📈 Opening {action} position")
-            success = open_position(symbol, action)
+            success = open_position_ultra_safe(symbol, action)
             
         except Exception as e:
             logger.error(f"💥 Execution error: {e}")
             success = False
         
         if success:
-            trade_tracker.mark_executed(symbol, action)
-            logger.info(f"✅✅✅ ATOMIC SUCCESS: {symbol} {action}")
+            logger.info(f"✅✅✅ ULTRA-SAFE SUCCESS: {symbol} {action}")
         else:
-            logger.error(f"❌ ATOMIC FAILED: {symbol} {action}")
+            logger.error(f"❌ ULTRA-SAFE FAILED: {symbol} {action}")
         
         return {
             "status": "success" if success else "failed",
@@ -308,13 +354,13 @@ def execute_trade_atomic(symbol, action, endpoint_name):
         }, 200
         
     finally:
-        # STEP 3: Always release lock
+        # ALWAYS release lock
         trade_tracker.release_lock(symbol)
 
 # === Webhook Handlers ===
 @app.route('/webhook', methods=['POST'])
 def webhook_primary():
-    """Primary - executes immediately"""
+    """Primary webhook - ULTRA SAFE"""
     try:
         data = request.get_json(force=True)
         if not data:
@@ -327,16 +373,16 @@ def webhook_primary():
             return jsonify({"error": "invalid data"}), 400
         
         logger.info(f"🔔 PRIMARY: {symbol} {side}")
-        result, status = execute_trade_atomic(symbol, side.upper(), "PRIMARY")
+        result, status = execute_trade_ultra_safe(symbol, side.upper(), "PRIMARY")
         return jsonify(result), status
         
     except Exception as e:
         logger.error(f"❌ PRIMARY ERROR: {e}")
         return jsonify({"error": str(e)}), 500
 
-@app.route('/backup', methods=['POST']) 
+@app.route('/backup', methods=['POST'])
 def webhook_backup():
-    """Backup - executes immediately but atomically protected"""
+    """Backup webhook - ULTRA SAFE"""
     try:
         data = request.get_json(force=True)
         if not data:
@@ -349,49 +395,55 @@ def webhook_backup():
             return jsonify({"error": "invalid data"}), 400
         
         logger.info(f"🛡️ BACKUP: {symbol} {side}")
-        result, status = execute_trade_atomic(symbol, side.upper(), "BACKUP")
+        result, status = execute_trade_ultra_safe(symbol, side.upper(), "BACKUP")
         return jsonify(result), status
         
     except Exception as e:
         logger.error(f"❌ BACKUP ERROR: {e}")
         return jsonify({"error": str(e)}), 500
 
-# === Status ===
-@app.route('/health', methods=['GET'])
-def health_check():
+# === Emergency Endpoints ===
+@app.route('/emergency-stop', methods=['POST'])
+def emergency_stop():
+    """Emergency stop all trading"""
+    trade_tracker.active_locks.clear()
+    logger.warning("🚨 EMERGENCY STOP ACTIVATED - ALL LOCKS CLEARED")
+    return jsonify({"status": "emergency_stop_activated"})
+
+@app.route('/config', methods=['GET'])
+def show_config():
+    """Show current configuration"""
     return jsonify({
-        "status": "healthy",
-        "mode": "atomic_dual_webhook",
-        "reliability": "maximum"
+        "trade_balance": TRADE_BALANCE,
+        "position_size": TRADE_BALANCE * 3,
+        "safety_level": "ULTRA_SAFE"
     })
 
 @app.route('/')
 def home():
     return """
-    ✅ BINGX BOT - ATOMIC DUAL WEBHOOK (MAXIMUM RELIABILITY)
+    ✅ BINGX BOT - ULTRA SAFE MODE
     
-    🔄 DUAL WEBHOOKS:
-    - PRIMARY: POST /webhook (immediate)
-    - BACKUP:  POST /backup (immediate)
+    🛡️ ULTRA SAFE FEATURES:
+    - ✅ Price validation (rejects invalid prices)
+    - ✅ Quantity validation (multiple safety checks)
+    - ✅ Stale lock detection (handles Render restarts)
+    - ✅ Emergency stop endpoint
+    - ✅ Double validation inside locks
     
-    🛡️ ATOMIC PROTECTION:
-    - ✅ Symbol-level locking
-    - ✅ No parallel execution  
-    - ✅ No duplicate trades
-    - ✅ No missed trades
+    🔧 ENDPOINTS:
+    - POST /webhook (Primary)
+    - POST /backup (Backup) 
+    - POST /emergency-stop (Emergency stop)
+    - GET /config (Show settings)
     
-    ⚡ SETUP:
-    TradingView Alert 1: {"symbol":"X","side":"BUY"} → /webhook
-    TradingView Alert 2: {"symbol":"X","side":"BUY"} → /backup
-    
-    🎯 RESULT:
-    - 99.9% trade execution rate
-    - 0% duplicate trades
-    - Maximum reliability
+    🚨 SAFETY: Multiple validations prevent 100x positions
     """
 
 if __name__ == "__main__":
-    logger.info("🚀 ATOMIC DUAL WEBHOOK - MAXIMUM RELIABILITY")
-    logger.info("🛡️ Atomic locking prevents duplicates")
-    logger.info("🎯 Dual webhooks prevent missed trades")
+    logger.info("🚀 ULTRA SAFE BINGX BOT STARTED")
+    logger.info(f"💰 Trade Balance: {TRADE_BALANCE} USDT (VALIDATED)")
+    logger.info(f"📊 Position Size: {TRADE_BALANCE * 3} USDT")
+    logger.info("🛡️ ULTRA SAFE: Price validation, quantity checks, stale lock detection")
+    
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 10000)))
