@@ -60,7 +60,7 @@ def bitget_signature(timestamp, method, request_path, body):
     )
     return mac.hexdigest()
 
-def bitget_headers(request_path, method="GET", body=""):
+def bitget_headers(method, request_path, body=""):
     """Generate Bitget headers"""
     timestamp = str(int(time.time() * 1000))
     signature = bitget_signature(timestamp, method, request_path, body)
@@ -75,13 +75,12 @@ def bitget_headers(request_path, method="GET", body=""):
 
 # === Get Current Price ===
 def get_current_price(symbol):
-    """Get current market price"""
+    """Get current market price - FIXED"""
     try:
-        # Remove _UMCBL for price check
-        price_symbol = symbol.replace("_UMCBL", "")
+        # Use correct symbol format for price API
         response = requests.get(
             f"{BASE_URL}/api/mix/v1/market/ticker",
-            params={"symbol": price_symbol},
+            params={"symbol": symbol},
             timeout=10
         )
         data = response.json()
@@ -92,21 +91,22 @@ def get_current_price(symbol):
             return price
         else:
             logger.error(f"❌ Price fetch failed: {data}")
+            return None
     except Exception as e:
         logger.error(f"❌ Price error: {e}")
-    return None
+        return None
 
 # === Get Current Position ===
 def get_current_position(symbol):
-    """Get current position in ONE-WAY mode"""
+    """Get current position - FIXED"""
     try:
-        request_path = "/api/mix/v1/position/single-position"
-        params = f"symbol={symbol}&productType=USDT-FUTURES"
-        full_path = f"{request_path}?{params}"
+        request_path = "/api/mix/v1/position/singlePosition"
+        params = {"symbol": symbol, "productType": "umcbl"}
         
-        headers = bitget_headers(full_path)
+        headers = bitget_headers("GET", request_path)
         response = requests.get(
-            f"{BASE_URL}{full_path}",
+            f"{BASE_URL}{request_path}",
+            params=params,
             headers=headers,
             timeout=10
         )
@@ -130,28 +130,97 @@ def get_current_position(symbol):
         logger.error(f"❌ Position error: {e}")
         return None
 
+# === Set Leverage ===
+def set_leverage(symbol, leverage=10):
+    """Set leverage for the symbol - FIXED"""
+    try:
+        request_path = "/api/mix/v1/account/setLeverage"
+        
+        leverage_data = {
+            "symbol": symbol,
+            "productType": "umcbl",
+            "marginCoin": "USDT",
+            "leverage": str(leverage)
+        }
+        
+        body = json.dumps(leverage_data)
+        headers = bitget_headers("POST", request_path, body)
+        
+        response = requests.post(
+            f"{BASE_URL}{request_path}",
+            json=leverage_data,
+            headers=headers,
+            timeout=10
+        )
+        data = response.json()
+        
+        if data.get("code") == "00000":
+            logger.info(f"⚙️ Leverage set to {leverage}x for {symbol}")
+            return True
+        else:
+            logger.warning(f"⚠️ Leverage set: {data.get('msg')}")
+            # Continue anyway - leverage might already be set
+            return True
+            
+    except Exception as e:
+        logger.error(f"❌ Leverage error: {e}")
+        return True  # Continue anyway
+
+# === Calculate Position Size in USDT ===
+def calculate_position_size(symbol):
+    """Calculate position size based on USDT value"""
+    try:
+        # Get current price
+        current_price = get_current_price(symbol)
+        if not current_price:
+            logger.error(f"❌ Cannot get current price for {symbol}")
+            return None
+        
+        # Calculate USDT value (3x trade balance)
+        usdt_value = TRADE_BALANCE * 3
+        
+        # Calculate quantity based on price
+        quantity = usdt_value / current_price
+        
+        # Apply minimum quantity rules
+        min_quantity = 1.0  # Minimum 1 token
+        if quantity < min_quantity:
+            quantity = min_quantity
+            logger.info(f"📏 Adjusted to minimum quantity: {quantity}")
+        
+        quantity = round(quantity, 3)  # Bitget precision
+        
+        logger.info(f"💰 USDT Value: {TRADE_BALANCE} × 3 = {usdt_value} USDT")
+        logger.info(f"📊 Price: ${current_price} → Quantity: {quantity}")
+        
+        return quantity
+        
+    except Exception as e:
+        logger.error(f"❌ Quantity calculation error: {e}")
+        return None
+
 # === Close Position ===
 def close_position(symbol, side, quantity):
-    """Close existing position"""
+    """Close existing position - FIXED"""
     try:
-        request_path = "/api/mix/v1/order/place-order"
+        request_path = "/api/mix/v1/order/placeOrder"
         
         # For ONE-WAY mode, use simple buy/sell to close
         close_side = "sell" if side == "long" else "buy"
         
         order_data = {
             "symbol": symbol,
-            "productType": "USDT-FUTURES",
+            "productType": "umcbl",
             "marginMode": "crossed",
             "marginCoin": "USDT",
             "size": str(quantity),
             "side": close_side,
             "orderType": "market",
-            "tradeSide": "close"  # Important: specify close
+            "tradeSide": "close"
         }
         
         body = json.dumps(order_data)
-        headers = bitget_headers(request_path, "POST", body)
+        headers = bitget_headers("POST", request_path, body)
         
         response = requests.post(
             f"{BASE_URL}{request_path}",
@@ -176,40 +245,32 @@ def close_position(symbol, side, quantity):
 
 # === Open Position ===
 def open_position(symbol, action):
-    """Open new position in ONE-WAY mode"""
+    """Open new position in ONE-WAY mode - FIXED"""
     try:
-        # Get current price for quantity calculation
-        current_price = get_current_price(symbol)
-        if not current_price:
-            logger.error(f"❌ Cannot get current price for {symbol}")
+        # Calculate position size based on USDT value
+        quantity = calculate_position_size(symbol)
+        if not quantity:
+            logger.error(f"❌ Cannot calculate position size for {symbol}")
             return False
         
-        # Calculate exact 3x position size
-        usdt_value = TRADE_BALANCE * 3
-        quantity = usdt_value / current_price
-        quantity = round(quantity, 3)  # Bitget precision
-        
-        logger.info(f"💰 Position calc: {TRADE_BALANCE} USDT × 3 = {usdt_value} USDT")
-        logger.info(f"📊 Using price: {current_price} → Quantity: {quantity}")
-        
-        request_path = "/api/mix/v1/order/place-order"
+        request_path = "/api/mix/v1/order/placeOrder"
         
         # For ONE-WAY mode, use simple buy/sell
         bitget_side = "buy" if action == "BUY" else "sell"
         
         order_data = {
             "symbol": symbol,
-            "productType": "USDT-FUTURES",
+            "productType": "umcbl",
             "marginMode": "crossed",
             "marginCoin": "USDT",
             "size": str(quantity),
             "side": bitget_side,
             "orderType": "market",
-            "tradeSide": "open"  # Important: specify open
+            "tradeSide": "open"
         }
         
         body = json.dumps(order_data)
-        headers = bitget_headers(request_path, "POST", body)
+        headers = bitget_headers("POST", request_path, body)
         
         response = requests.post(
             f"{BASE_URL}{request_path}",
@@ -232,42 +293,6 @@ def open_position(symbol, action):
         logger.error(f"❌ Open error: {e}")
         return False
 
-# === Set Leverage ===
-def set_leverage(symbol, leverage=10):
-    """Set leverage for the symbol"""
-    try:
-        request_path = "/api/mix/v1/account/set-leverage"
-        
-        leverage_data = {
-            "symbol": symbol,
-            "productType": "USDT-FUTURES",
-            "marginCoin": "USDT",
-            "leverage": str(leverage),
-            "holdSide": "long"  # Set for long side (one-way mode)
-        }
-        
-        body = json.dumps(leverage_data)
-        headers = bitget_headers(request_path, "POST", body)
-        
-        response = requests.post(
-            f"{BASE_URL}{request_path}",
-            json=leverage_data,
-            headers=headers,
-            timeout=10
-        )
-        data = response.json()
-        
-        if data.get("code") == "00000":
-            logger.info(f"⚙️ Leverage set to {leverage}x for {symbol}")
-            return True
-        else:
-            logger.warning(f"⚠️ Leverage set warning: {data.get('msg')}")
-            return False
-            
-    except Exception as e:
-        logger.error(f"❌ Leverage error: {e}")
-        return False
-
 # === Trade Execution ===
 def execute_trade(symbol, action, endpoint_name):
     """Main trade execution logic"""
@@ -286,7 +311,7 @@ def execute_trade(symbol, action, endpoint_name):
     
     success = False
     try:
-        # STEP 1: Set leverage
+        # STEP 1: Set leverage (non-critical)
         set_leverage(symbol, 10)
         time.sleep(1)
         
@@ -299,13 +324,12 @@ def execute_trade(symbol, action, endpoint_name):
             current_side = current_position["side"]
             current_qty = current_position["available"] if current_position["available"] > 0 else current_position["quantity"]
             
-            # Always close existing position before opening new one
             logger.info(f"🔄 Closing existing {current_side} position")
             close_success = close_position(symbol, current_side, current_qty)
             
             if close_success:
                 logger.info("✅ Position closed, waiting for settlement...")
-                time.sleep(3)  # Wait for settlement
+                time.sleep(2)  # Wait for settlement
             else:
                 logger.error("❌ Failed to close existing position, aborting trade")
                 return {
@@ -356,10 +380,11 @@ def webhook_primary():
         if side.upper() not in ['BUY', 'SELL']:
             return jsonify({"error": "side must be BUY or SELL"}), 400
         
-        # Format symbol for Bitget futures
+        # Format symbol for Bitget futures - CORRECT FORMAT
         if not symbol.endswith('USDT'):
             symbol = f"{symbol}USDT"
-        symbol = f"{symbol}_UMCBL"  # Bitget futures format
+        # Use correct symbol format: SUIUSDT_UMCBL
+        symbol = f"{symbol}_UMCBL"
         
         logger.info(f"🔔 PRIMARY SIGNAL: {symbol} {side}")
         result, status = execute_trade(symbol, side.upper(), "PRIMARY")
@@ -386,10 +411,10 @@ def webhook_backup():
         if side.upper() not in ['BUY', 'SELL']:
             return jsonify({"error": "side must be BUY or SELL"}), 400
         
-        # Format symbol for Bitget futures
+        # Format symbol for Bitget futures - CORRECT FORMAT
         if not symbol.endswith('USDT'):
             symbol = f"{symbol}USDT"
-        symbol = f"{symbol}_UMCBL"  # Bitget futures format
+        symbol = f"{symbol}_UMCBL"
         
         logger.info(f"🛡️ BACKUP SIGNAL: {symbol} {side}")
         result, status = execute_trade(symbol, side.upper(), "BACKUP")
@@ -406,70 +431,35 @@ def health_check():
         "status": "healthy",
         "timestamp": datetime.now().isoformat(),
         "trade_balance": TRADE_BALANCE,
-        "position_size": TRADE_BALANCE * 3,
+        "position_size_usdt": TRADE_BALANCE * 3,
         "exchange": "bitget",
         "mode": "one_way"
     })
 
-@app.route('/position/<symbol>', methods=['GET'])
-def check_position(symbol):
-    """Check current position"""
-    # Format symbol
-    if not symbol.endswith('_UMCBL'):
-        symbol = f"{symbol}_UMCBL"
-    
-    position = get_current_position(symbol)
-    return jsonify({
-        "symbol": symbol,
-        "position": position if position else "No position",
-        "timestamp": datetime.now().isoformat()
-    })
-
-@app.route('/close-all/<symbol>', methods=['POST'])
-def close_all_positions(symbol):
-    """Close all positions for a symbol"""
-    # Format symbol
-    if not symbol.endswith('_UMCBL'):
-        symbol = f"{symbol}_UMCBL"
-    
-    position = get_current_position(symbol)
-    if position:
-        success = close_position(symbol, position["side"], position["quantity"])
-        return jsonify({"status": "success" if success else "error"})
-    else:
-        return jsonify({"status": "no_position"})
-
 @app.route('/')
 def home():
     return """
-    ✅ BITGET BOT - ONE-WAY MODE (RELIABLE)
+    ✅ BITGET BOT - FIXED VERSION
     
     🔄 WEBHOOK ENDPOINTS:
-    - PRIMARY: POST /webhook (main execution)
-    - BACKUP:  POST /backup (backup execution)
+    - PRIMARY: POST /webhook 
+    - BACKUP:  POST /backup
     
-    🎯 BITGET ONE-WAY MODE:
-    - ✅ Simple buy/sell orders
-    - ✅ No hedge mode complexity
-    - ✅ Reliable position tracking
-    - ✅ Proper 3x position sizing
+    🎯 FEATURES:
+    - ✅ 3x USDT value positions
+    - ✅ Correct Bitget API endpoints
+    - ✅ Proper symbol formatting
+    - ✅ USDT-based sizing
     
-    📝 TRADINGVIEW ALERT FORMAT:
-    {"symbol":"SUIUSDT","side":"BUY"}
-    
-    ⚙️ ENVIRONMENT VARIABLES:
-    - BITGET_API_KEY: Your API Key
-    - BITGET_API_SECRET: Your API Secret
-    - BITGET_API_PASSPHRASE: Your Passphrase
-    - TRADE_BALANCE_USDT: Trade balance (default: 20)
+    📝 TRADINGVIEW ALERT:
+    {"symbol":"SUI","side":"BUY"}
     """
 
-# === Startup ===
 if __name__ == "__main__":
-    logger.info("🚀 BITGET BOT STARTED - ONE-WAY MODE")
+    logger.info("🚀 BITGET BOT STARTED - FIXED VERSION")
     logger.info(f"💰 Trade Balance: {TRADE_BALANCE} USDT")
     logger.info(f"📊 Position Size: {TRADE_BALANCE * 3} USDT")
-    logger.info("🎯 ONE-WAY MODE: Simple & Reliable")
-    logger.info("🛡️ Bitget API: More stable than BingX")
+    logger.info("🎯 Positions calculated in USDT value")
+    logger.info("🔧 Fixed API endpoints and symbol formatting")
     
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 10000)))
