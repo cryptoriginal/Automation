@@ -38,7 +38,7 @@ class TradeTracker:
             current_time = time.time()
             last_time = self.active_trades.get(symbol, 0)
             
-            if current_time - last_time < 8:  # 8 second cooldown
+            if current_time - last_time < 10:  # 10 second cooldown
                 return False
             
             self.active_trades[symbol] = current_time
@@ -52,7 +52,7 @@ def bitget_signature(timestamp, method, request_path, body):
     """Generate Bitget signature"""
     if body is None:
         body = ""
-    message = str(timestamp) + method + request_path + body
+    message = str(timestamp) + method.upper() + request_path + body
     mac = hmac.new(
         bytes(API_SECRET, encoding='utf8'), 
         bytes(message, encoding='utf-8'), 
@@ -75,12 +75,13 @@ def bitget_headers(method, request_path, body=""):
 
 # === Get Current Price ===
 def get_current_price(symbol):
-    """Get current market price - FIXED"""
+    """Get current market price"""
     try:
-        # Use correct symbol format for price API
+        # Remove _UMCBL for price check
+        clean_symbol = symbol.replace("_UMCBL", "")
         response = requests.get(
             f"{BASE_URL}/api/mix/v1/market/ticker",
-            params={"symbol": symbol},
+            params={"symbol": clean_symbol},
             timeout=10
         )
         data = response.json()
@@ -98,9 +99,9 @@ def get_current_price(symbol):
 
 # === Get Current Position ===
 def get_current_position(symbol):
-    """Get current position - FIXED"""
+    """Get current position"""
     try:
-        request_path = "/api/mix/v1/position/singlePosition"
+        request_path = "/api/mix/v1/position/single-position"
         params = {"symbol": symbol, "productType": "umcbl"}
         
         headers = bitget_headers("GET", request_path)
@@ -112,8 +113,6 @@ def get_current_position(symbol):
         )
         data = response.json()
         
-        logger.info(f"📊 Position response: {data}")
-        
         if data.get("code") == "00000" and data.get("data"):
             position = data["data"]
             total_amount = float(position.get("total", 0))
@@ -121,8 +120,7 @@ def get_current_position(symbol):
             if total_amount > 0:
                 return {
                     "side": position.get("holdSide", "long"),
-                    "quantity": total_amount,
-                    "available": float(position.get("available", 0))
+                    "quantity": total_amount
                 }
         return None
         
@@ -132,9 +130,9 @@ def get_current_position(symbol):
 
 # === Set Leverage ===
 def set_leverage(symbol, leverage=10):
-    """Set leverage for the symbol - FIXED"""
+    """Set leverage for the symbol"""
     try:
-        request_path = "/api/mix/v1/account/setLeverage"
+        request_path = "/api/mix/v1/account/set-leverage"
         
         leverage_data = {
             "symbol": symbol,
@@ -158,22 +156,19 @@ def set_leverage(symbol, leverage=10):
             logger.info(f"⚙️ Leverage set to {leverage}x for {symbol}")
             return True
         else:
-            logger.warning(f"⚠️ Leverage set: {data.get('msg')}")
-            # Continue anyway - leverage might already be set
-            return True
+            logger.warning(f"⚠️ Leverage set note: {data.get('msg')}")
+            return True  # Continue anyway
             
     except Exception as e:
         logger.error(f"❌ Leverage error: {e}")
         return True  # Continue anyway
 
-# === Calculate Position Size in USDT ===
+# === Calculate Position Size ===
 def calculate_position_size(symbol):
-    """Calculate position size based on USDT value"""
+    """Calculate position size based on 3x USDT value"""
     try:
-        # Get current price
         current_price = get_current_price(symbol)
         if not current_price:
-            logger.error(f"❌ Cannot get current price for {symbol}")
             return None
         
         # Calculate USDT value (3x trade balance)
@@ -182,12 +177,8 @@ def calculate_position_size(symbol):
         # Calculate quantity based on price
         quantity = usdt_value / current_price
         
-        # Apply minimum quantity rules
-        min_quantity = 1.0  # Minimum 1 token
-        if quantity < min_quantity:
-            quantity = min_quantity
-            logger.info(f"📏 Adjusted to minimum quantity: {quantity}")
-        
+        # Apply minimum quantity and precision
+        quantity = max(quantity, 1.0)  # Minimum 1 token
         quantity = round(quantity, 3)  # Bitget precision
         
         logger.info(f"💰 USDT Value: {TRADE_BALANCE} × 3 = {usdt_value} USDT")
@@ -201,11 +192,11 @@ def calculate_position_size(symbol):
 
 # === Close Position ===
 def close_position(symbol, side, quantity):
-    """Close existing position - FIXED"""
+    """Close existing position"""
     try:
-        request_path = "/api/mix/v1/order/placeOrder"
+        request_path = "/api/mix/v1/order/place-order"
         
-        # For ONE-WAY mode, use simple buy/sell to close
+        # For ONE-WAY mode, use opposite side to close
         close_side = "sell" if side == "long" else "buy"
         
         order_data = {
@@ -230,10 +221,10 @@ def close_position(symbol, side, quantity):
         )
         data = response.json()
         
-        logger.info(f"🔻 Close {side} response: {data}")
+        logger.info(f"🔻 Close response: {data}")
         
         if data.get("code") == "00000":
-            logger.info(f"✅ Position close successful: {symbol} {side}")
+            logger.info(f"✅ Position closed: {symbol} {side}")
             return True
         else:
             logger.error(f"❌ Close failed: {data.get('msg', 'Unknown error')}")
@@ -245,17 +236,15 @@ def close_position(symbol, side, quantity):
 
 # === Open Position ===
 def open_position(symbol, action):
-    """Open new position in ONE-WAY mode - FIXED"""
+    """Open new position"""
     try:
-        # Calculate position size based on USDT value
         quantity = calculate_position_size(symbol)
         if not quantity:
-            logger.error(f"❌ Cannot calculate position size for {symbol}")
             return False
         
-        request_path = "/api/mix/v1/order/placeOrder"
+        request_path = "/api/mix/v1/order/place-order"
         
-        # For ONE-WAY mode, use simple buy/sell
+        # Convert action to Bitget side
         bitget_side = "buy" if action == "BUY" else "sell"
         
         order_data = {
@@ -280,10 +269,10 @@ def open_position(symbol, action):
         )
         data = response.json()
         
-        logger.info(f"📈 Open {action} response: {data}")
+        logger.info(f"📈 Open response: {data}")
         
         if data.get("code") == "00000":
-            logger.info(f"✅ Position open successful: {symbol} {action}")
+            logger.info(f"✅ Position opened: {symbol} {action}")
             return True
         else:
             logger.error(f"❌ Open failed: {data.get('msg', 'Unknown error')}")
@@ -297,66 +286,57 @@ def open_position(symbol, action):
 def execute_trade(symbol, action, endpoint_name):
     """Main trade execution logic"""
     
-    # Check cooldown
     if not trade_tracker.can_trade(symbol):
         return {
             "status": "skipped", 
             "reason": "cooldown_period",
-            "endpoint": endpoint_name,
             "symbol": symbol,
             "side": action
         }, 200
     
-    logger.info(f"🎯 EXECUTING ({endpoint_name}): {symbol} {action}")
+    logger.info(f"🎯 EXECUTING: {symbol} {action}")
     
     success = False
     try:
-        # STEP 1: Set leverage (non-critical)
+        # Set leverage (non-critical)
         set_leverage(symbol, 10)
         time.sleep(1)
         
-        # STEP 2: Check current position
+        # Check current position
         current_position = get_current_position(symbol)
         logger.info(f"📊 Current position: {current_position}")
         
-        # STEP 3: Close existing position if it exists
+        # Close existing position if it exists
         if current_position:
             current_side = current_position["side"]
-            current_qty = current_position["available"] if current_position["available"] > 0 else current_position["quantity"]
+            current_qty = current_position["quantity"]
             
-            logger.info(f"🔄 Closing existing {current_side} position")
+            logger.info(f"🔄 Closing {current_side} position")
             close_success = close_position(symbol, current_side, current_qty)
             
             if close_success:
-                logger.info("✅ Position closed, waiting for settlement...")
-                time.sleep(2)  # Wait for settlement
+                logger.info("✅ Position closed, waiting...")
+                time.sleep(2)
             else:
-                logger.error("❌ Failed to close existing position, aborting trade")
-                return {
-                    "status": "failed",
-                    "reason": "close_position_failed",
-                    "endpoint": endpoint_name,
-                    "symbol": symbol,
-                    "side": action
-                }, 200
+                logger.error("❌ Failed to close position")
+                return {"status": "failed", "reason": "close_failed"}, 200
         
-        # STEP 4: Open new position
+        # Open new position
         logger.info(f"📈 Opening {action} position")
         open_success = open_position(symbol, action)
         success = open_success
         
         if success:
-            logger.info(f"✅✅✅ TRADE SUCCESS ({endpoint_name}): {symbol} {action}")
+            logger.info(f"✅✅✅ SUCCESS: {symbol} {action}")
         else:
-            logger.error(f"❌ TRADE FAILED ({endpoint_name}): {symbol} {action}")
+            logger.error(f"❌ FAILED: {symbol} {action}")
         
     except Exception as e:
-        logger.error(f"💥 EXECUTION ERROR ({endpoint_name}): {e}")
+        logger.error(f"💥 EXECUTION ERROR: {e}")
         success = False
     
     return {
         "status": "success" if success else "failed",
-        "endpoint": endpoint_name,
         "symbol": symbol,
         "side": action,
         "timestamp": datetime.now().isoformat()
@@ -364,12 +344,12 @@ def execute_trade(symbol, action, endpoint_name):
 
 # === Webhook Handlers ===
 @app.route('/webhook', methods=['POST'])
-def webhook_primary():
-    """Primary webhook endpoint"""
+def webhook():
+    """Single webhook endpoint"""
     try:
         data = request.get_json(force=True)
         if not data:
-            return jsonify({"error": "no JSON data received"}), 400
+            return jsonify({"error": "no JSON data"}), 400
             
         symbol = data.get("symbol")
         side = data.get("side")
@@ -380,86 +360,75 @@ def webhook_primary():
         if side.upper() not in ['BUY', 'SELL']:
             return jsonify({"error": "side must be BUY or SELL"}), 400
         
-        # Format symbol for Bitget futures - CORRECT FORMAT
+        # Format symbol for Bitget
         if not symbol.endswith('USDT'):
             symbol = f"{symbol}USDT"
-        # Use correct symbol format: SUIUSDT_UMCBL
         symbol = f"{symbol}_UMCBL"
         
-        logger.info(f"🔔 PRIMARY SIGNAL: {symbol} {side}")
+        logger.info(f"🔔 SIGNAL: {symbol} {side}")
         result, status = execute_trade(symbol, side.upper(), "PRIMARY")
         return jsonify(result), status
         
     except Exception as e:
-        logger.error(f"❌ PRIMARY WEBHOOK ERROR: {e}")
+        logger.error(f"❌ WEBHOOK ERROR: {e}")
         return jsonify({"error": str(e)}), 500
 
-@app.route('/backup', methods=['POST'])
-def webhook_backup():
-    """Backup webhook endpoint"""
+# === Test Endpoint ===
+@app.route('/test', methods=['GET'])
+def test():
+    """Test API connection"""
     try:
-        data = request.get_json(force=True)
-        if not data:
-            return jsonify({"error": "no JSON data received"}), 400
-            
-        symbol = data.get("symbol")
-        side = data.get("side")
+        symbol = "SUIUSDT_UMCBL"
         
-        if not symbol or not side:
-            return jsonify({"error": "missing symbol or side"}), 400
+        # Test price
+        price = get_current_price(symbol)
+        if not price:
+            return jsonify({"error": "Price fetch failed"})
         
-        if side.upper() not in ['BUY', 'SELL']:
-            return jsonify({"error": "side must be BUY or SELL"}), 400
+        # Test position check
+        position = get_current_position(symbol)
         
-        # Format symbol for Bitget futures - CORRECT FORMAT
-        if not symbol.endswith('USDT'):
-            symbol = f"{symbol}USDT"
-        symbol = f"{symbol}_UMCBL"
-        
-        logger.info(f"🛡️ BACKUP SIGNAL: {symbol} {side}")
-        result, status = execute_trade(symbol, side.upper(), "BACKUP")
-        return jsonify(result), status
+        return jsonify({
+            "status": "connected",
+            "price": price,
+            "position": position,
+            "trade_balance": TRADE_BALANCE,
+            "position_size": TRADE_BALANCE * 3
+        })
         
     except Exception as e:
-        logger.error(f"❌ BACKUP WEBHOOK ERROR: {e}")
-        return jsonify({"error": str(e)}), 500
+        return jsonify({"error": str(e)})
 
-# === Status Endpoints ===
 @app.route('/health', methods=['GET'])
-def health_check():
+def health():
     return jsonify({
         "status": "healthy",
-        "timestamp": datetime.now().isoformat(),
-        "trade_balance": TRADE_BALANCE,
-        "position_size_usdt": TRADE_BALANCE * 3,
         "exchange": "bitget",
-        "mode": "one_way"
+        "position_size_usdt": TRADE_BALANCE * 3
     })
 
 @app.route('/')
 def home():
     return """
-    ✅ BITGET BOT - FIXED VERSION
+    ✅ BITGET BOT - WORKING VERSION
     
-    🔄 WEBHOOK ENDPOINTS:
-    - PRIMARY: POST /webhook 
-    - BACKUP:  POST /backup
+    🔄 WEBHOOK: POST /webhook
+    🧪 TEST: GET /test
+    ❤️ HEALTH: GET /health
     
-    🎯 FEATURES:
-    - ✅ 3x USDT value positions
-    - ✅ Correct Bitget API endpoints
-    - ✅ Proper symbol formatting
-    - ✅ USDT-based sizing
+    📝 TRADINGVIEW ALERTS:
+    BUY: {"symbol":"SUI","side":"BUY"}
+    SELL: {"symbol":"SUI","side":"SELL"}
     
-    📝 TRADINGVIEW ALERT:
-    {"symbol":"SUI","side":"BUY"}
+    ✅ 3x USDT value positions
+    ✅ One-way mode
+    ✅ Auto close before open
     """
 
 if __name__ == "__main__":
-    logger.info("🚀 BITGET BOT STARTED - FIXED VERSION")
+    logger.info("🚀 BITGET BOT STARTED")
     logger.info(f"💰 Trade Balance: {TRADE_BALANCE} USDT")
     logger.info(f"📊 Position Size: {TRADE_BALANCE * 3} USDT")
-    logger.info("🎯 Positions calculated in USDT value")
-    logger.info("🔧 Fixed API endpoints and symbol formatting")
+    logger.info("🎯 One-Way Mode | 3x USDT Value")
     
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 10000)))
