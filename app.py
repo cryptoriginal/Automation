@@ -75,10 +75,10 @@ def bitget_headers(method, request_path, body=""):
 
 # === Get Current Price ===
 def get_current_price(symbol):
-    """Get current market price - CORRECTED"""
+    """Get current market price - FIXED"""
     try:
-        # Use clean symbol without _UMCBL for price API
-        clean_symbol = symbol.replace("UMCBL", "USDT").replace("_", "")
+        # For price API, use just the base symbol (e.g., SUIUSDT)
+        clean_symbol = symbol.replace("UMCBL", "").replace("_", "")
         logger.info(f"🔍 Fetching price for: {clean_symbol}")
         
         response = requests.get(
@@ -101,7 +101,7 @@ def get_current_price(symbol):
 
 # === Get Current Position ===
 def get_current_position(symbol):
-    """Get current position - SIMPLIFIED"""
+    """Get current position"""
     try:
         request_path = "/api/mix/v1/position/all-position"
         params = {"productType": "umcbl"}
@@ -157,7 +157,7 @@ def calculate_position_size(symbol):
 
 # === Place Order ===
 def place_order(symbol, side, quantity, trade_side="open"):
-    """Place order - CORRECTED"""
+    """Place order"""
     try:
         request_path = "/api/mix/v1/order/placeOrder"
         
@@ -252,6 +252,18 @@ def execute_trade(symbol, action):
         "timestamp": datetime.now().isoformat()
     }, 200
 
+# === Symbol Formatting ===
+def format_symbol(input_symbol):
+    """Convert TradingView symbol to Bitget format"""
+    # Remove any existing USDT and format correctly
+    clean_symbol = input_symbol.replace("USDT", "").upper()
+    
+    # Bitget futures format: BASEUSDT_UMCBL (e.g., SUIUSDT_UMCBL)
+    bitget_symbol = f"{clean_symbol}USDT_UMCBL"
+    
+    logger.info(f"🔧 Symbol conversion: {input_symbol} → {bitget_symbol}")
+    return bitget_symbol
+
 # === Webhook Handler ===
 @app.route('/webhook', methods=['POST'])
 def webhook():
@@ -270,13 +282,11 @@ def webhook():
         if side.upper() not in ['BUY', 'SELL']:
             return jsonify({"error": "side must be BUY or SELL"}), 400
         
-        # CORRECT Bitget symbol format
-        if not symbol.endswith('USDT'):
-            symbol = f"{symbol}USDT"
-        symbol = f"{symbol}UMCBL"  # Correct format: SUIUSDTUMCBL
+        # CORRECT Bitget symbol formatting
+        bitget_symbol = format_symbol(symbol)
         
-        logger.info(f"🔔 SIGNAL: {symbol} {side}")
-        result, status = execute_trade(symbol, side.upper())
+        logger.info(f"🔔 SIGNAL: {bitget_symbol} {side}")
+        result, status = execute_trade(bitget_symbol, side.upper())
         return jsonify(result), status
         
     except Exception as e:
@@ -288,17 +298,18 @@ def webhook():
 def test():
     """Test API connection"""
     try:
-        symbol = "SUIUSDTUMCBL"
+        # Test with SUI
+        test_symbol = format_symbol("SUI")
         
         # Test price
-        price = get_current_price(symbol)
+        price = get_current_price(test_symbol)
         
         # Test position check
-        position = get_current_position(symbol)
+        position = get_current_position(test_symbol)
         
         return jsonify({
             "status": "connected",
-            "symbol": symbol,
+            "symbol": test_symbol,
             "price": price,
             "position": position,
             "trade_balance": TRADE_BALANCE,
@@ -316,27 +327,40 @@ def health():
         "position_size_usdt": TRADE_BALANCE * 3
     })
 
+@app.route('/symbols', methods=['GET'])
+def list_symbols():
+    """List available symbols for testing"""
+    symbols = {
+        "SUI": format_symbol("SUI"),
+        "ETH": format_symbol("ETH"), 
+        "BTC": format_symbol("BTC"),
+        "ADA": format_symbol("ADA"),
+        "DOT": format_symbol("DOT")
+    }
+    return jsonify(symbols)
+
 @app.route('/')
 def home():
     return """
-    ✅ BITGET BOT - CORRECTED VERSION
+    ✅ BITGET BOT - EXACT WORKING VERSION
     
     🔄 WEBHOOK: POST /webhook
     🧪 TEST: GET /test
+    📋 SYMBOLS: GET /symbols
     
     📝 TRADINGVIEW ALERTS:
     BUY: {"symbol":"SUI","side":"BUY"}
     SELL: {"symbol":"SUI","side":"SELL"}
     
-    ✅ Uses correct symbol format: SUIUSDTUMCBL
+    ✅ Correct symbol format: SUIUSDT_UMCBL
     ✅ 3x USDT value positions
     ✅ One-way mode
     """
 
 if __name__ == "__main__":
-    logger.info("🚀 BITGET BOT STARTED - CORRECTED")
+    logger.info("🚀 BITGET BOT STARTED - EXACT WORKING VERSION")
     logger.info(f"💰 Trade Balance: {TRADE_BALANCE} USDT")
     logger.info(f"📊 Position Size: {TRADE_BALANCE * 3} USDT")
-    logger.info("🎯 Correct symbol format: SUIUSDTUMCBL")
+    logger.info("🎯 Correct symbol format: BASEUSDT_UMCBL")
     
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 10000)))
