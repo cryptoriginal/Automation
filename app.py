@@ -2,8 +2,8 @@ import os
 import time
 import hmac
 import hashlib
-import json
 import requests
+import json
 from flask import Flask, request, jsonify
 import threading
 import logging
@@ -18,432 +18,458 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# --- BingX Configuration ---
-API_KEY = os.getenv("BINGX_API_KEY")
-SECRET_KEY = os.getenv("BINGX_SECRET_KEY")
-TRADE_BALANCE = float(os.getenv("TRADE_BALANCE_USDT", "50"))
+# --- Bitget Configuration ---
+API_KEY = os.getenv("BITGET_API_KEY")
+API_SECRET = os.getenv("BITGET_API_SECRET")
+API_PASSPHRASE = os.getenv("BITGET_API_PASSPHRASE")
+TRADE_BALANCE = float(os.getenv("TRADE_BALANCE_USDT", "20"))
 
-# VALIDATE CRITICAL CONFIG
-if TRADE_BALANCE > 100:
-    logger.error(f"🚨 DANGER: TRADE_BALANCE too high: {TRADE_BALANCE}")
-    TRADE_BALANCE = 20  # Force safe default
+BASE_URL = "https://api.bitget.com"
 
-BASE_URL = "https://open-api.bingx.com"
-
-# ULTRA-SAFE Trade Tracker
-class UltraSafeTradeTracker:
+# Trade tracking
+class TradeTracker:
     def __init__(self):
-        self.active_locks = {}
-        self.last_trades = {}
+        self.active_trades = {}
         self._lock = threading.Lock()
-        self.position_cache = {}
-        
-    def safe_acquire_lock(self, symbol, max_wait=5):
-        """ULTRA-SAFE lock with timeout and stale detection"""
-        start_time = time.time()
-        while time.time() - start_time < max_wait:
-            with self._lock:
-                current_time = time.time()
-                
-                # Clean stale locks (older than 30 seconds)
-                if symbol in self.active_locks:
-                    lock_time = self.active_locks[symbol]
-                    if current_time - lock_time > 30:
-                        del self.active_locks[symbol]
-                
-                # Acquire lock if available
-                if symbol not in self.active_locks:
-                    self.active_locks[symbol] = current_time
-                    return True
-            
-            time.sleep(0.1)
-        return False
     
-    def release_lock(self, symbol):
-        """Release lock"""
-        with self._lock:
-            if symbol in self.active_locks:
-                del self.active_locks[symbol]
-    
-    def can_trade(self, symbol, side):
-        """ULTRA-SAFE trade validation"""
+    def can_trade(self, symbol):
+        """Simple cooldown check"""
         with self._lock:
             current_time = time.time()
-            last_trade = self.last_trades.get(symbol, {})
+            last_time = self.active_trades.get(symbol, 0)
             
-            # Same trade within 10 seconds - BLOCK
-            if (last_trade.get('side') == side and 
-                current_time - last_trade.get('timestamp', 0) < 10):
+            if current_time - last_time < 8:  # 8 second cooldown
                 return False
-                
-            # Any trade within 5 seconds - BLOCK
-            if current_time - last_trade.get('timestamp', 0) < 5:
-                return False
-                
+            
+            self.active_trades[symbol] = current_time
             return True
-    
-    def record_trade(self, symbol, side, quantity):
-        """Record trade execution"""
-        with self._lock:
-            self.last_trades[symbol] = {
-                'side': side,
-                'quantity': quantity,
-                'timestamp': time.time()
-            }
 
 # Initialize tracker
-trade_tracker = UltraSafeTradeTracker()
+trade_tracker = TradeTracker()
 
-# === BingX Signature ===
-def bingx_signature(params):
-    query_string = '&'.join([f"{key}={value}" for key, value in sorted(params.items())])
-    return hmac.new(
-        SECRET_KEY.encode('utf-8'),
-        query_string.encode('utf-8'),
-        hashlib.sha256
-    ).hexdigest()
+# === Bitget Signature ===
+def bitget_signature(timestamp, method, request_path, body):
+    """Generate Bitget signature"""
+    if body is None:
+        body = ""
+    message = str(timestamp) + method + request_path + body
+    mac = hmac.new(
+        bytes(API_SECRET, encoding='utf8'), 
+        bytes(message, encoding='utf-8'), 
+        digestmod='sha256'
+    )
+    return mac.hexdigest()
 
-def bingx_headers():
-    return {"X-BX-APIKEY": API_KEY, "Content-Type": "application/json"}
+def bitget_headers(request_path, method="GET", body=""):
+    """Generate Bitget headers"""
+    timestamp = str(int(time.time() * 1000))
+    signature = bitget_signature(timestamp, method, request_path, body)
+    
+    return {
+        "ACCESS-KEY": API_KEY,
+        "ACCESS-SIGN": signature,
+        "ACCESS-TIMESTAMP": timestamp,
+        "ACCESS-PASSPHRASE": API_PASSPHRASE,
+        "Content-Type": "application/json"
+    }
 
-# === ULTRA-SAFE Price Check ===
-def get_current_price_safe(symbol):
-    """ULTRA-SAFE price getter with validation"""
-    for attempt in range(3):
-        try:
-            params = {"symbol": symbol}
-            response = requests.get(
-                f"{BASE_URL}/openApi/swap/v2/quote/price",
-                params=params,
-                timeout=10
-            )
-            data = response.json()
-            
-            if data.get("code") == 0 and "data" in data:
-                price = float(data["data"]["price"])
-                
-                # CRITICAL SAFETY CHECK
-                if price <= 0:
-                    logger.error(f"🚨 INVALID PRICE: {price} for {symbol}")
-                    continue
-                if price > 100000:  # Unrealistically high price
-                    logger.error(f"🚨 SUSPICIOUS PRICE: {price} for {symbol}")
-                    continue
-                    
-                logger.info(f"✅ Valid price for {symbol}: ${price}")
-                return price
-                
-        except Exception as e:
-            logger.error(f"❌ Price error: {e}")
+# === Get Current Price ===
+def get_current_price(symbol):
+    """Get current market price"""
+    try:
+        # Remove _UMCBL for price check
+        price_symbol = symbol.replace("_UMCBL", "")
+        response = requests.get(
+            f"{BASE_URL}/api/mix/v1/market/ticker",
+            params={"symbol": price_symbol},
+            timeout=10
+        )
+        data = response.json()
         
-        time.sleep(1)
-    
-    logger.error(f"🚨 ALL PRICE ATTEMPTS FAILED FOR {symbol}")
+        if data.get("code") == "00000":
+            price = float(data["data"]["last"])
+            logger.info(f"✅ Price for {symbol}: ${price}")
+            return price
+        else:
+            logger.error(f"❌ Price fetch failed: {data}")
+    except Exception as e:
+        logger.error(f"❌ Price error: {e}")
     return None
-
-# === ULTRA-SAFE Quantity Calculator ===
-def calculate_safe_quantity(symbol, action):
-    """ULTRA-SAFE quantity calculation with multiple validations"""
-    # STEP 1: Get safe price
-    current_price = get_current_price_safe(symbol)
-    if not current_price:
-        return None
-    
-    # STEP 2: Calculate base quantity
-    usdt_value = TRADE_BALANCE * 3
-    raw_quantity = usdt_value / current_price
-    
-    # STEP 3: CRITICAL SAFETY VALIDATION
-    expected_max_quantity = (TRADE_BALANCE * 10) / current_price  # 10x safety margin
-    
-    if raw_quantity > expected_max_quantity:
-        logger.error(f"🚨 DANGEROUS QUANTITY: {raw_quantity} > max {expected_max_quantity}")
-        logger.error(f"   Price: {current_price}, USDT Value: {usdt_value}")
-        return None
-    
-    # STEP 4: Apply precision
-    safe_quantity = round(raw_quantity, 4)
-    
-    # STEP 5: Final validation
-    calculated_value = safe_quantity * current_price
-    expected_value = TRADE_BALANCE * 3
-    
-    if abs(calculated_value - expected_value) > expected_value * 0.5:  # 50% tolerance
-        logger.error(f"🚨 QUANTITY VALIDATION FAILED: {calculated_value} vs {expected_value}")
-        return None
-    
-    logger.info(f"✅ SAFE QUANTITY: {safe_quantity} {symbol} (Value: ${calculated_value})")
-    return safe_quantity
 
 # === Get Current Position ===
 def get_current_position(symbol):
-    for attempt in range(2):
-        try:
-            params = {"symbol": symbol, "timestamp": int(time.time() * 1000)}
-            signature = bingx_signature(params)
-            params["signature"] = signature
-            
-            response = requests.get(
-                f"{BASE_URL}/openApi/swap/v2/user/positions",
-                headers=bingx_headers(),
-                params=params,
-                timeout=10
-            )
-            data = response.json()
-            
-            if data.get("code") == 0 and "data" in data:
-                positions = data["data"]
-                for position in positions:
-                    position_amt = float(position.get("positionAmt", 0))
-                    if position_amt != 0:
-                        return {
-                            "side": "LONG" if position_amt > 0 else "SHORT",
-                            "quantity": abs(position_amt)
-                        }
-                return None
-        except Exception as e:
-            logger.error(f"❌ Position error: {e}")
-        time.sleep(1)
-    return None
-
-# === ULTRA-SAFE Open Position ===
-def open_position_ultra_safe(symbol, action):
-    """ULTRA-SAFE position opener"""
-    # STEP 1: Calculate safe quantity
-    quantity = calculate_safe_quantity(symbol, action)
-    if not quantity:
-        logger.error(f"🚨 ABORTING: Invalid quantity calculation for {symbol}")
-        return False
-    
-    # STEP 2: Execute trade
-    for attempt in range(2):
-        try:
-            params = {
-                "symbol": symbol,
-                "side": action,
-                "positionSide": "BOTH",
-                "type": "MARKET",
-                "quantity": quantity,
-                "timestamp": int(time.time() * 1000)
-            }
-            
-            signature = bingx_signature(params)
-            params["signature"] = signature
-            
-            response = requests.post(
-                f"{BASE_URL}/openApi/swap/v2/trade/order",
-                headers=bingx_headers(),
-                json=params,
-                timeout=15
-            )
-            data = response.json()
-            
-            logger.info(f"📈 Open {action} response: {data}")
-            
-            if data.get("code") == 0:
-                logger.info(f"✅ ULTRA-SAFE OPEN SUCCESS: {symbol} {action}")
-                trade_tracker.record_trade(symbol, action, quantity)
-                return True
-            else:
-                logger.error(f"❌ Open failed: {data.get('msg')}")
-        except Exception as e:
-            logger.error(f"❌ Open error: {e}")
+    """Get current position in ONE-WAY mode"""
+    try:
+        request_path = "/api/mix/v1/position/single-position"
+        params = f"symbol={symbol}&productType=USDT-FUTURES"
+        full_path = f"{request_path}?{params}"
         
-        if attempt < 1:
-            time.sleep(2)
-    
-    return False
+        headers = bitget_headers(full_path)
+        response = requests.get(
+            f"{BASE_URL}{full_path}",
+            headers=headers,
+            timeout=10
+        )
+        data = response.json()
+        
+        logger.info(f"📊 Position response: {data}")
+        
+        if data.get("code") == "00000" and data.get("data"):
+            position = data["data"]
+            total_amount = float(position.get("total", 0))
+            
+            if total_amount > 0:
+                return {
+                    "side": position.get("holdSide", "long"),
+                    "quantity": total_amount,
+                    "available": float(position.get("available", 0))
+                }
+        return None
+        
+    except Exception as e:
+        logger.error(f"❌ Position error: {e}")
+        return None
 
 # === Close Position ===
 def close_position(symbol, side, quantity):
-    for attempt in range(2):
-        try:
-            close_side = "SELL" if side == "LONG" else "BUY"
-            
-            params = {
-                "symbol": symbol,
-                "side": close_side,
-                "positionSide": "BOTH",
-                "type": "MARKET",
-                "quantity": quantity,
-                "timestamp": int(time.time() * 1000)
-            }
-            
-            signature = bingx_signature(params)
-            params["signature"] = signature
-            
-            response = requests.post(
-                f"{BASE_URL}/openApi/swap/v2/trade/order",
-                headers=bingx_headers(),
-                json=params,
-                timeout=15
-            )
-            data = response.json()
-            
-            if data.get("code") == 0:
-                logger.info(f"✅ Close successful: {symbol} {side}")
-                return True
-        except Exception as e:
-            logger.error(f"❌ Close error: {e}")
-        time.sleep(2)
-    return False
-
-# === ULTRA-SAFE Trade Execution ===
-def execute_trade_ultra_safe(symbol, action, endpoint_name):
-    """ULTRA-SAFE trade execution with maximum protection"""
-    
-    # STEP 1: Pre-validation
-    if not trade_tracker.can_trade(symbol, action):
-        logger.info(f"⏸️ Cooldown active for {symbol}, skipping")
-        return {"status": "skipped", "reason": "cooldown"}, 200
-    
-    # STEP 2: Acquire ULTRA-SAFE lock
-    if not trade_tracker.safe_acquire_lock(symbol):
-        logger.info(f"⏸️ {symbol} locked, skipping {action}")
-        return {"status": "skipped", "reason": "locked"}, 200
-    
+    """Close existing position"""
     try:
-        # DOUBLE CHECK inside lock
-        if not trade_tracker.can_trade(symbol, action):
-            logger.info(f"⏸️ Cooldown confirmed inside lock, skipping")
-            return {"status": "skipped", "reason": "cooldown_confirmed"}, 200
+        request_path = "/api/mix/v1/order/place-order"
         
-        logger.info(f"🎯 ULTRA-SAFE EXECUTION ({endpoint_name}): {symbol} {action}")
+        # For ONE-WAY mode, use simple buy/sell to close
+        close_side = "sell" if side == "long" else "buy"
         
-        success = False
-        try:
-            # Check current position
-            current_position = get_current_position(symbol)
-            logger.info(f"📊 Current position: {current_position}")
-            
-            # Close existing position if needed
-            if current_position:
-                current_side = current_position["side"]
-                current_qty = current_position["quantity"]
-                
-                need_to_close = False
-                if (action == "BUY" and current_side == "SHORT") or (action == "SELL" and current_side == "LONG"):
-                    need_to_close = True
-                elif (action == "BUY" and current_side == "LONG") or (action == "SELL" and current_side == "SHORT"):
-                    need_to_close = True
-                
-                if need_to_close:
-                    logger.info(f"🔄 Closing {current_side} position")
-                    if close_position(symbol, current_side, current_qty):
-                        time.sleep(2)
-            
-            # ULTRA-SAFE open
-            logger.info(f"📈 Opening {action} position")
-            success = open_position_ultra_safe(symbol, action)
-            
-        except Exception as e:
-            logger.error(f"💥 Execution error: {e}")
-            success = False
+        order_data = {
+            "symbol": symbol,
+            "productType": "USDT-FUTURES",
+            "marginMode": "crossed",
+            "marginCoin": "USDT",
+            "size": str(quantity),
+            "side": close_side,
+            "orderType": "market",
+            "tradeSide": "close"  # Important: specify close
+        }
         
-        if success:
-            logger.info(f"✅✅✅ ULTRA-SAFE SUCCESS: {symbol} {action}")
+        body = json.dumps(order_data)
+        headers = bitget_headers(request_path, "POST", body)
+        
+        response = requests.post(
+            f"{BASE_URL}{request_path}",
+            json=order_data,
+            headers=headers,
+            timeout=15
+        )
+        data = response.json()
+        
+        logger.info(f"🔻 Close {side} response: {data}")
+        
+        if data.get("code") == "00000":
+            logger.info(f"✅ Position close successful: {symbol} {side}")
+            return True
         else:
-            logger.error(f"❌ ULTRA-SAFE FAILED: {symbol} {action}")
+            logger.error(f"❌ Close failed: {data.get('msg', 'Unknown error')}")
+            return False
+            
+    except Exception as e:
+        logger.error(f"❌ Close error: {e}")
+        return False
+
+# === Open Position ===
+def open_position(symbol, action):
+    """Open new position in ONE-WAY mode"""
+    try:
+        # Get current price for quantity calculation
+        current_price = get_current_price(symbol)
+        if not current_price:
+            logger.error(f"❌ Cannot get current price for {symbol}")
+            return False
         
+        # Calculate exact 3x position size
+        usdt_value = TRADE_BALANCE * 3
+        quantity = usdt_value / current_price
+        quantity = round(quantity, 3)  # Bitget precision
+        
+        logger.info(f"💰 Position calc: {TRADE_BALANCE} USDT × 3 = {usdt_value} USDT")
+        logger.info(f"📊 Using price: {current_price} → Quantity: {quantity}")
+        
+        request_path = "/api/mix/v1/order/place-order"
+        
+        # For ONE-WAY mode, use simple buy/sell
+        bitget_side = "buy" if action == "BUY" else "sell"
+        
+        order_data = {
+            "symbol": symbol,
+            "productType": "USDT-FUTURES",
+            "marginMode": "crossed",
+            "marginCoin": "USDT",
+            "size": str(quantity),
+            "side": bitget_side,
+            "orderType": "market",
+            "tradeSide": "open"  # Important: specify open
+        }
+        
+        body = json.dumps(order_data)
+        headers = bitget_headers(request_path, "POST", body)
+        
+        response = requests.post(
+            f"{BASE_URL}{request_path}",
+            json=order_data,
+            headers=headers,
+            timeout=15
+        )
+        data = response.json()
+        
+        logger.info(f"📈 Open {action} response: {data}")
+        
+        if data.get("code") == "00000":
+            logger.info(f"✅ Position open successful: {symbol} {action}")
+            return True
+        else:
+            logger.error(f"❌ Open failed: {data.get('msg', 'Unknown error')}")
+            return False
+            
+    except Exception as e:
+        logger.error(f"❌ Open error: {e}")
+        return False
+
+# === Set Leverage ===
+def set_leverage(symbol, leverage=10):
+    """Set leverage for the symbol"""
+    try:
+        request_path = "/api/mix/v1/account/set-leverage"
+        
+        leverage_data = {
+            "symbol": symbol,
+            "productType": "USDT-FUTURES",
+            "marginCoin": "USDT",
+            "leverage": str(leverage),
+            "holdSide": "long"  # Set for long side (one-way mode)
+        }
+        
+        body = json.dumps(leverage_data)
+        headers = bitget_headers(request_path, "POST", body)
+        
+        response = requests.post(
+            f"{BASE_URL}{request_path}",
+            json=leverage_data,
+            headers=headers,
+            timeout=10
+        )
+        data = response.json()
+        
+        if data.get("code") == "00000":
+            logger.info(f"⚙️ Leverage set to {leverage}x for {symbol}")
+            return True
+        else:
+            logger.warning(f"⚠️ Leverage set warning: {data.get('msg')}")
+            return False
+            
+    except Exception as e:
+        logger.error(f"❌ Leverage error: {e}")
+        return False
+
+# === Trade Execution ===
+def execute_trade(symbol, action, endpoint_name):
+    """Main trade execution logic"""
+    
+    # Check cooldown
+    if not trade_tracker.can_trade(symbol):
         return {
-            "status": "success" if success else "failed",
+            "status": "skipped", 
+            "reason": "cooldown_period",
             "endpoint": endpoint_name,
             "symbol": symbol,
-            "side": action,
-            "timestamp": datetime.now().isoformat()
+            "side": action
         }, 200
+    
+    logger.info(f"🎯 EXECUTING ({endpoint_name}): {symbol} {action}")
+    
+    success = False
+    try:
+        # STEP 1: Set leverage
+        set_leverage(symbol, 10)
+        time.sleep(1)
         
-    finally:
-        # ALWAYS release lock
-        trade_tracker.release_lock(symbol)
+        # STEP 2: Check current position
+        current_position = get_current_position(symbol)
+        logger.info(f"📊 Current position: {current_position}")
+        
+        # STEP 3: Close existing position if it exists
+        if current_position:
+            current_side = current_position["side"]
+            current_qty = current_position["available"] if current_position["available"] > 0 else current_position["quantity"]
+            
+            # Always close existing position before opening new one
+            logger.info(f"🔄 Closing existing {current_side} position")
+            close_success = close_position(symbol, current_side, current_qty)
+            
+            if close_success:
+                logger.info("✅ Position closed, waiting for settlement...")
+                time.sleep(3)  # Wait for settlement
+            else:
+                logger.error("❌ Failed to close existing position, aborting trade")
+                return {
+                    "status": "failed",
+                    "reason": "close_position_failed",
+                    "endpoint": endpoint_name,
+                    "symbol": symbol,
+                    "side": action
+                }, 200
+        
+        # STEP 4: Open new position
+        logger.info(f"📈 Opening {action} position")
+        open_success = open_position(symbol, action)
+        success = open_success
+        
+        if success:
+            logger.info(f"✅✅✅ TRADE SUCCESS ({endpoint_name}): {symbol} {action}")
+        else:
+            logger.error(f"❌ TRADE FAILED ({endpoint_name}): {symbol} {action}")
+        
+    except Exception as e:
+        logger.error(f"💥 EXECUTION ERROR ({endpoint_name}): {e}")
+        success = False
+    
+    return {
+        "status": "success" if success else "failed",
+        "endpoint": endpoint_name,
+        "symbol": symbol,
+        "side": action,
+        "timestamp": datetime.now().isoformat()
+    }, 200
 
 # === Webhook Handlers ===
 @app.route('/webhook', methods=['POST'])
 def webhook_primary():
-    """Primary webhook - ULTRA SAFE"""
+    """Primary webhook endpoint"""
     try:
         data = request.get_json(force=True)
         if not data:
-            return jsonify({"error": "no data"}), 400
+            return jsonify({"error": "no JSON data received"}), 400
             
         symbol = data.get("symbol")
         side = data.get("side")
         
-        if not symbol or not side or side.upper() not in ['BUY', 'SELL']:
-            return jsonify({"error": "invalid data"}), 400
+        if not symbol or not side:
+            return jsonify({"error": "missing symbol or side"}), 400
         
-        logger.info(f"🔔 PRIMARY: {symbol} {side}")
-        result, status = execute_trade_ultra_safe(symbol, side.upper(), "PRIMARY")
+        if side.upper() not in ['BUY', 'SELL']:
+            return jsonify({"error": "side must be BUY or SELL"}), 400
+        
+        # Format symbol for Bitget futures
+        if not symbol.endswith('USDT'):
+            symbol = f"{symbol}USDT"
+        symbol = f"{symbol}_UMCBL"  # Bitget futures format
+        
+        logger.info(f"🔔 PRIMARY SIGNAL: {symbol} {side}")
+        result, status = execute_trade(symbol, side.upper(), "PRIMARY")
         return jsonify(result), status
         
     except Exception as e:
-        logger.error(f"❌ PRIMARY ERROR: {e}")
+        logger.error(f"❌ PRIMARY WEBHOOK ERROR: {e}")
         return jsonify({"error": str(e)}), 500
 
 @app.route('/backup', methods=['POST'])
 def webhook_backup():
-    """Backup webhook - ULTRA SAFE"""
+    """Backup webhook endpoint"""
     try:
         data = request.get_json(force=True)
         if not data:
-            return jsonify({"error": "no data"}), 400
+            return jsonify({"error": "no JSON data received"}), 400
             
         symbol = data.get("symbol")
         side = data.get("side")
         
-        if not symbol or not side or side.upper() not in ['BUY', 'SELL']:
-            return jsonify({"error": "invalid data"}), 400
+        if not symbol or not side:
+            return jsonify({"error": "missing symbol or side"}), 400
         
-        logger.info(f"🛡️ BACKUP: {symbol} {side}")
-        result, status = execute_trade_ultra_safe(symbol, side.upper(), "BACKUP")
+        if side.upper() not in ['BUY', 'SELL']:
+            return jsonify({"error": "side must be BUY or SELL"}), 400
+        
+        # Format symbol for Bitget futures
+        if not symbol.endswith('USDT'):
+            symbol = f"{symbol}USDT"
+        symbol = f"{symbol}_UMCBL"  # Bitget futures format
+        
+        logger.info(f"🛡️ BACKUP SIGNAL: {symbol} {side}")
+        result, status = execute_trade(symbol, side.upper(), "BACKUP")
         return jsonify(result), status
         
     except Exception as e:
-        logger.error(f"❌ BACKUP ERROR: {e}")
+        logger.error(f"❌ BACKUP WEBHOOK ERROR: {e}")
         return jsonify({"error": str(e)}), 500
 
-# === Emergency Endpoints ===
-@app.route('/emergency-stop', methods=['POST'])
-def emergency_stop():
-    """Emergency stop all trading"""
-    trade_tracker.active_locks.clear()
-    logger.warning("🚨 EMERGENCY STOP ACTIVATED - ALL LOCKS CLEARED")
-    return jsonify({"status": "emergency_stop_activated"})
-
-@app.route('/config', methods=['GET'])
-def show_config():
-    """Show current configuration"""
+# === Status Endpoints ===
+@app.route('/health', methods=['GET'])
+def health_check():
     return jsonify({
+        "status": "healthy",
+        "timestamp": datetime.now().isoformat(),
         "trade_balance": TRADE_BALANCE,
         "position_size": TRADE_BALANCE * 3,
-        "safety_level": "ULTRA_SAFE"
+        "exchange": "bitget",
+        "mode": "one_way"
     })
+
+@app.route('/position/<symbol>', methods=['GET'])
+def check_position(symbol):
+    """Check current position"""
+    # Format symbol
+    if not symbol.endswith('_UMCBL'):
+        symbol = f"{symbol}_UMCBL"
+    
+    position = get_current_position(symbol)
+    return jsonify({
+        "symbol": symbol,
+        "position": position if position else "No position",
+        "timestamp": datetime.now().isoformat()
+    })
+
+@app.route('/close-all/<symbol>', methods=['POST'])
+def close_all_positions(symbol):
+    """Close all positions for a symbol"""
+    # Format symbol
+    if not symbol.endswith('_UMCBL'):
+        symbol = f"{symbol}_UMCBL"
+    
+    position = get_current_position(symbol)
+    if position:
+        success = close_position(symbol, position["side"], position["quantity"])
+        return jsonify({"status": "success" if success else "error"})
+    else:
+        return jsonify({"status": "no_position"})
 
 @app.route('/')
 def home():
     return """
-    ✅ BINGX BOT - ULTRA SAFE MODE
+    ✅ BITGET BOT - ONE-WAY MODE (RELIABLE)
     
-    🛡️ ULTRA SAFE FEATURES:
-    - ✅ Price validation (rejects invalid prices)
-    - ✅ Quantity validation (multiple safety checks)
-    - ✅ Stale lock detection (handles Render restarts)
-    - ✅ Emergency stop endpoint
-    - ✅ Double validation inside locks
+    🔄 WEBHOOK ENDPOINTS:
+    - PRIMARY: POST /webhook (main execution)
+    - BACKUP:  POST /backup (backup execution)
     
-    🔧 ENDPOINTS:
-    - POST /webhook (Primary)
-    - POST /backup (Backup) 
-    - POST /emergency-stop (Emergency stop)
-    - GET /config (Show settings)
+    🎯 BITGET ONE-WAY MODE:
+    - ✅ Simple buy/sell orders
+    - ✅ No hedge mode complexity
+    - ✅ Reliable position tracking
+    - ✅ Proper 3x position sizing
     
-    🚨 SAFETY: Multiple validations prevent 100x positions
+    📝 TRADINGVIEW ALERT FORMAT:
+    {"symbol":"SUIUSDT","side":"BUY"}
+    
+    ⚙️ ENVIRONMENT VARIABLES:
+    - BITGET_API_KEY: Your API Key
+    - BITGET_API_SECRET: Your API Secret
+    - BITGET_API_PASSPHRASE: Your Passphrase
+    - TRADE_BALANCE_USDT: Trade balance (default: 20)
     """
 
+# === Startup ===
 if __name__ == "__main__":
-    logger.info("🚀 ULTRA SAFE BINGX BOT STARTED")
-    logger.info(f"💰 Trade Balance: {TRADE_BALANCE} USDT (VALIDATED)")
+    logger.info("🚀 BITGET BOT STARTED - ONE-WAY MODE")
+    logger.info(f"💰 Trade Balance: {TRADE_BALANCE} USDT")
     logger.info(f"📊 Position Size: {TRADE_BALANCE * 3} USDT")
-    logger.info("🛡️ ULTRA SAFE: Price validation, quantity checks, stale lock detection")
+    logger.info("🎯 ONE-WAY MODE: Simple & Reliable")
+    logger.info("🛡️ Bitget API: More stable than BingX")
     
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 10000)))
